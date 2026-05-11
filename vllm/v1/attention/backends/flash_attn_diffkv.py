@@ -20,8 +20,6 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 
 if is_flash_attn_varlen_func_available():
     from vllm.v1.attention.backends.fa_utils import flash_attn_varlen_func
-from vllm.v1.attention.backends.utils import get_kv_cache_layout
-
 from .flash_attn import (
     FlashAttentionBackend,
     FlashAttentionImpl,
@@ -47,48 +45,6 @@ class FlashAttentionDiffKVBackend(FlashAttentionBackend):
     @staticmethod
     def get_impl_cls() -> type["FlashAttentionImpl"]:
         return FlashAttentionDiffKVImpl
-
-    # Do not modify the interface of get_kv_cache_shape,
-    # but consider head_size_v when returning result.
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        if block_size % 16 != 0:
-            raise ValueError("Block size must be a multiple of 16.")
-        return (
-            num_blocks,
-            block_size,
-            num_kv_heads,
-            head_size + FlashAttentionDiffKVBackend.head_size_v,
-        )
-
-    @staticmethod
-    def get_kv_cache_stride_order(
-        include_num_layers_dimension: bool = False,
-    ) -> tuple[int, ...]:
-        # `stride_order` indicates the permutation that gets
-        # us from `get_kv_cache_shape` to the actual memory layout we want.
-        cache_layout = get_kv_cache_layout()
-        if cache_layout == "NHD" and include_num_layers_dimension:
-            # (num_blocks, num_layers, block_size,
-            # num_kv_heads, head_size + head_size_v)
-            return (1, 0, 2, 3, 4)
-        elif cache_layout == "NHD":
-            stride_order = (0, 1, 2, 3)
-        elif cache_layout == "HND" and include_num_layers_dimension:
-            # (num_blocks, num_kv_heads, num_layers,
-            # block_size, head_size + head_size_v)
-            return (1, 3, 0, 2, 4)
-        elif cache_layout == "HND":
-            stride_order = (0, 2, 1, 3)
-        else:
-            raise ValueError(f"Unknown cache layout format {cache_layout}.")
-        return stride_order
 
 
 class FlashAttentionDiffKVImpl(FlashAttentionImpl):

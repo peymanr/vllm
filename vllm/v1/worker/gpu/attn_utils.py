@@ -14,12 +14,15 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
 )
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
     UniformTypeKVCacheSpecs,
+    compute_kv_cache_shape,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
@@ -148,7 +151,10 @@ def _reshape_kv_cache(
     kv_cache_raw_tensors: dict[str, torch.Tensor],
     attn_backends: dict[str, type[AttentionBackend]],
     cache_dtype: str,
+    layout: KVCacheLayout | None = None,
 ) -> dict[str, Any]:
+    if layout is None:
+        layout = resolve_kv_cache_layout()
     kv_caches: dict[str, Any] = {}
     has_attn, has_mamba = False, False
     for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
@@ -163,21 +169,13 @@ def _reshape_kv_cache(
 
             if isinstance(kv_cache_spec, AttentionSpec):
                 has_attn = True
-                attn_backend = attn_backends[layer_name]
-                kv_cache_shape = attn_backend.get_kv_cache_shape(
+                kv_cache_shape = compute_kv_cache_shape(
+                    kv_cache_spec,
                     num_blocks,
                     kv_cache_spec.storage_block_size,
-                    kv_cache_spec.num_kv_heads,
-                    kv_cache_spec.head_size,
-                    cache_dtype_str=cache_dtype,
                 )
 
-                # FIXME(woosuk): Add kv_cache_stride_order to all attention backends.
-                try:
-                    kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                    assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                except (AttributeError, NotImplementedError):
-                    kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
+                kv_cache_stride_order = layout.per_layer_stride_order
 
                 kv_cache_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
                 inv_order = [
@@ -188,13 +186,6 @@ def _reshape_kv_cache(
                 dtype = kv_cache_spec.dtype
                 kv_tensor = kv_raw_tensor.view(dtype)
                 if kv_cache_spec.page_size_padded is not None:
-                    # Use strided view to handle page_size_bytes that
-                    # include padding. This follows the same pattern as
-                    # MambaSpec handling in gpu_model_runner.py.
-                    # NOTE: This assumes kv_cache_shape[0] == num_blocks
-                    # (i.e. the first physical dimension is the block
-                    # index), which holds for all current backends
-                    # (MLA, FlashAttention, TritonAttention, etc.).
                     dtype_size = get_dtype_size(dtype)
                     page_stride = kv_cache_spec.page_size_bytes // dtype_size
                     strides = list(torch.empty(kv_cache_shape).stride())
@@ -205,9 +196,13 @@ def _reshape_kv_cache(
                         stride=tuple(strides),
                     )
                 else:
-                    # No padding — safe to use a contiguous view.
                     kv_cache = kv_tensor.view(kv_cache_shape)
-                kv_caches[layer_name] = kv_cache.permute(*inv_order)
+                kv_tensor_final = kv_cache.permute(*inv_order)
+                # Squeeze H dim for headless specs (MLA) — backends
+                # treat the latent as a flat (B, S, C) tensor.
+                if kv_cache_spec.num_heads == 1:
+                    kv_tensor_final = kv_tensor_final.squeeze(-2)
+                kv_caches[layer_name] = kv_tensor_final
 
             elif isinstance(kv_cache_spec, MambaSpec):
                 has_mamba = True
@@ -274,10 +269,15 @@ def init_kv_cache(
     attn_backends: dict[str, type[AttentionBackend]],
     device: torch.device,
     cache_dtype: str,
+    layout: KVCacheLayout | None = None,
 ) -> dict[str, Any]:
     kv_cache_raw_tensors = _allocate_kv_cache(kv_cache_config, device)
     kv_caches = _reshape_kv_cache(
-        kv_cache_config, kv_cache_raw_tensors, attn_backends, cache_dtype
+        kv_cache_config,
+        kv_cache_raw_tensors,
+        attn_backends,
+        cache_dtype,
+        layout=layout,
     )
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches

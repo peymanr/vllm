@@ -118,16 +118,6 @@ class FlexAttentionBackend(AttentionBackend):
         return FlexAttentionImpl
 
     @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
-
-    @staticmethod
     def get_builder_cls() -> type["FlexAttentionMetadataBuilder"]:
         return FlexAttentionMetadataBuilder
 
@@ -1005,7 +995,9 @@ class FlexAttentionImpl(AttentionImpl):
         if self.attn_type == AttentionType.ENCODER_ONLY:
             return
 
-        key_cache, value_cache = kv_cache.unbind(1)
+        hs = self.head_size
+        key_cache = kv_cache[..., :hs]
+        value_cache = kv_cache[..., hs:]
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
             value,
@@ -1110,7 +1102,9 @@ class FlexAttentionImpl(AttentionImpl):
 
         else:
             assert self.attn_type == AttentionType.DECODER
-            key_cache, value_cache = kv_cache.unbind(1)
+            hs = self.head_size
+            key_cache = kv_cache[..., :hs]
+            value_cache = kv_cache[..., hs:]
 
             # Flatten (num_blocks, block_size) into a single token dim
             key_cache = key_cache.reshape(-1, self.num_kv_heads, self.head_size)

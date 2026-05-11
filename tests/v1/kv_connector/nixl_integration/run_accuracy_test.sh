@@ -4,7 +4,6 @@ set -xe
 # Parse command line arguments
 KV_BUFFER_DEVICE="cuda"  # Default to cuda
 ATTENTION_BACKEND=""  # Default to empty (use vllm default)
-CROSS_LAYERS_BLOCKS="False"
 ENABLE_HMA_VAR=""  # Default to empty (HMA disabled by default for kv connector)
 # Check for ENABLE_HMA_FLAG environment variable
 if [[ -n "${ENABLE_HMA_FLAG:-}" ]]; then
@@ -20,10 +19,6 @@ while [[ $# -gt 0 ]]; do
     --attention-backend)
       ATTENTION_BACKEND="$2"
       shift 2
-      ;;
-    --enable-cross-layers)
-      CROSS_LAYERS_BLOCKS="True"
-      shift 1
       ;;
     *)
       echo "Unknown option $1"
@@ -51,11 +46,7 @@ else
   KV_CONFIG_HETERO_LAYOUT=''
 fi
 
-if [[ "$CROSS_LAYERS_BLOCKS" == "True" ]]; then
-  KV_EXTRA_CONFIG=',"kv_connector_extra_config":{"enable_cross_layers_blocks": "True"}'
-else
-  KV_EXTRA_CONFIG=''
-fi
+KV_EXTRA_CONFIG=''
 
 # Build the kv-transfer-config once
 if [[ "$KV_BUFFER_DEVICE" == "cuda" ]]; then

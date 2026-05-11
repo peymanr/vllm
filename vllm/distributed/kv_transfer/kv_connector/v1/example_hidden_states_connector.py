@@ -107,15 +107,6 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
     Must be used in conjunction with the `extract_hidden_states` spec decoding method.
     """
 
-    @property
-    def prefer_cross_layer_blocks(self) -> bool:
-        """
-        Indicates whether this connector prefers KV blocks that hold KV data for all
-        layers, which can speed up KV data transfers. Defaults to False.
-        """
-        # Must be False so that drafter kv cache isn't merged with verifier's
-        return False
-
     def __init__(
         self,
         vllm_config: "VllmConfig",

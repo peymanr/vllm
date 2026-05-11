@@ -83,16 +83,6 @@ class CPUAttentionBackend(AttentionBackend):
         return CPUAttentionMetadataBuilder
 
     @staticmethod
-    def get_kv_cache_shape(
-        num_blocks: int,
-        block_size: int,
-        num_kv_heads: int,
-        head_size: int,
-        cache_dtype_str: str = "auto",
-    ) -> tuple[int, ...]:
-        return 2, num_blocks, num_kv_heads, block_size, head_size
-
-    @staticmethod
     def use_cascade_attention(*args, **kwargs) -> bool:
         return False
 
@@ -330,9 +320,10 @@ class CPUAttentionBackendImpl(AttentionImpl):
                 self.attn_type,
             )
 
-        # For decoder and cross-attention, use KV cache, size are
-        # [num_blocks, num_kv_heads, block_size, head_size]
-        key_cache, value_cache = kv_cache.unbind(0)
+        # For decoder and cross-attention, split K/V from the content dim.
+        hs = self.head_size
+        key_cache = kv_cache[..., :hs]
+        value_cache = kv_cache[..., hs:]
 
         # key and value may be None in the case of cross attention. They are
         # calculated once based on the output from the encoder and then cached

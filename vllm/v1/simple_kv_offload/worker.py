@@ -105,13 +105,10 @@ class SimpleCPUOffloadWorker:
         # Build [num_blocks, block_bytes] int8 views from each unique
         # storage so that stride(0) gives block_bytes for the copy op.
         #
-        # The physical layout varies across attention backends:
-        #   FlashAttn/ROCm:  (2, num_blocks, ...) -> K/V outermost, 2 segments
-        #   FlashInfer/MLA:  (num_blocks, ...)    -> blocks outermost, 1 segment
-        # We derive page_size_bytes = storage.nbytes() // num_blocks, then
-        # classify dims: any dim whose byte-stride exceeds page_size_bytes
-        # must be an outer segment dim (e.g. the K/V dim of size 2). A less
-        # hacky way is to update the interface with the layout.
+        # With standardized layouts (RFC #42082), num_blocks is always the
+        # leading logical dim. Legacy backends with K/V outermost still
+        # produce outer segment dims. We detect them by comparing
+        # byte-strides against page_size_bytes.
         unique_gpu_caches: dict[str, torch.Tensor] = {}
         for name, tensor in seen_ptrs.values():
             storage = tensor.untyped_storage()

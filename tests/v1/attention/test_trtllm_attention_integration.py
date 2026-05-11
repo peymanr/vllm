@@ -113,8 +113,8 @@ def _create_hnd_kv_cache(
     slot_mapping = common_attn_metadata.slot_mapping
     batch_size = len(k_contexts)
 
-    # Build cache in (2, num_blocks, block_size, num_kv_heads, head_size)
-    # then convert to HND format (same approach as test_attention_backends.py).
+    # Build cache with K/V outermost for flat indexing, then convert to
+    # HND format (same approach as test_attention_backends.py).
     kv_cache_raw = torch.zeros(
         2,
         num_blocks,

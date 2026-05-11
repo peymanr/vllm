@@ -774,17 +774,6 @@ class NixlConnectorWorker:
 
         fut.add_done_callback(request_ready)
 
-    def register_cross_layers_kv_caches(self, kv_cache: torch.Tensor) -> None:
-        """Register a cross-layers KV cache tensor with NIXL.
-
-        `use_uniform_kv_cache()` guarantees a single KV cache group whose
-        layers all share the same `AttentionSpec`, so any layer name from
-        `_layer_specs` yields the correct per-layer spec for `page_size_bytes`.
-        """
-        first_layer = next(iter(self._layer_specs))
-        # Forwarding a real layer name rather than a synthetic key
-        self.register_kv_caches({first_layer: kv_cache})
-
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
         self.transfer_topo = TransferTopology(
@@ -802,7 +791,7 @@ class NixlConnectorWorker:
             is_mamba=self._has_mamba,
         )
         self.compat_hash = compute_nixl_compatibility_hash(
-            self.vllm_config, self.backend_name, self.transfer_topo.cross_layers_blocks
+            self.vllm_config, self.backend_name
         )
 
         if self.use_host_buffer:
@@ -867,11 +856,6 @@ class NixlConnectorWorker:
             )
             # For when registering multiple tensors eg K/V in separate regions.
             physical_page_size = physical_page_size // len(cache_list)
-            if self.transfer_topo._cross_layers_blocks:
-                # When cross-layers blocks are used, multiply by number of layers
-                physical_page_size = physical_page_size * len(
-                    self.kv_cache_config.kv_cache_tensors
-                )
             num_blocks = (
                 self._logical_num_blocks
                 if isinstance(layer_spec, MambaSpec)

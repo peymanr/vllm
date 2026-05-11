@@ -145,10 +145,12 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    compute_kv_cache_shape,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -500,9 +502,6 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
-        # Initialize in initialize_kv_cache_tensors
-        self.cross_layers_kv_cache: torch.Tensor | None = None
-        self.cross_layers_attn_backend: type[AttentionBackend] | None = None
         # indexes: [kv_cache_group_id][attn_group]
         self.attn_groups: list[list[AttentionGroup]] = []
         # self.kv_cache_config: KVCacheConfig
@@ -6023,9 +6022,6 @@ class GPUModelRunner(
             for i in range(len(self.kv_caches)):
                 self.kv_caches[i] = None  # type: ignore
             self.kv_caches.clear()
-        if hasattr(self, "cross_layers_kv_cache"):
-            self.cross_layers_kv_cache = None
-            self.cross_layers_attn_backend = None
         if hasattr(self, "attn_groups"):
             self.attn_groups.clear()
         if hasattr(self, "kv_cache_config"):
@@ -6647,6 +6643,11 @@ class GPUModelRunner(
         Initializes the KV cache buffer with the correct size. The buffer needs
         to be reshaped to the desired shape before being used by the models.
 
+        When all kv_cache_tensors in a config have the same size (uniform
+        group), a single contiguous allocation is used. Cross-layer
+        contiguity is then achieved via the stride order chosen at reshape
+        time (e.g. BLNHC puts the blocks dimension outermost).
+
         Args:
             kv_cache_config: The KV cache config
         Returns:
@@ -6654,12 +6655,27 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
+
+        tensor_sizes = {t.size for t in kv_cache_config.kv_cache_tensors}
+        if len(tensor_sizes) == 1:
+            # Uniform group: allocate one contiguous tensor for all layers.
+            per_layer_size = tensor_sizes.pop()
+            num_layers = len(kv_cache_config.kv_cache_tensors)
+            group_tensor = torch.zeros(
+                per_layer_size * num_layers, dtype=torch.int8, device=self.device
             )
-            for layer_name in kv_cache_tensor.shared_by:
-                kv_cache_raw_tensors[layer_name] = tensor
+            for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
+                layer_view = group_tensor[i * per_layer_size : (i + 1) * per_layer_size]
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = layer_view
+        else:
+            # Non-uniform: allocate per kv_cache_tensor independently.
+            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+                tensor = torch.zeros(
+                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                )
+                for layer_name in kv_cache_tensor.shared_by:
+                    kv_cache_raw_tensors[layer_name] = tensor
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
@@ -6685,6 +6701,7 @@ class GPUModelRunner(
         self,
         kv_cache_raw_tensors: dict[str, torch.Tensor],
         kernel_block_sizes: list[int],
+        layout: KVCacheLayout | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Reshape the KV cache tensors to the desired shape and dtype.
@@ -6693,17 +6710,20 @@ class GPUModelRunner(
             kv_cache_raw_tensors: The KV cache buffer of each layer, with
                 correct size but uninitialized shape.
             kernel_block_sizes: The kernel block sizes for each KV cache group.
+            layout: Physical KV cache layout. If None, resolved from config.
         Returns:
             Dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        if layout is None:
+            from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+            layout = resolve_kv_cache_layout()
         kv_caches: dict[str, torch.Tensor] = {}
         has_attn, has_mamba = False, False
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
-            attn_backend = group.backend
             if group.kv_cache_group_id == len(kernel_block_sizes):
-                # There may be a last group for layers without kv cache.
                 continue
             kernel_block_size = kernel_block_sizes[group.kv_cache_group_id]
             for layer_name in group.layer_names:
@@ -6725,24 +6745,13 @@ class GPUModelRunner(
                     else:
                         shape_block_size = kernel_block_size
 
-                    kv_cache_shape = attn_backend.get_kv_cache_shape(
+                    kv_cache_shape = compute_kv_cache_shape(
+                        kv_cache_spec,
                         kernel_num_blocks,
                         shape_block_size,
-                        kv_cache_spec.num_kv_heads,
-                        kv_cache_spec.head_size,
-                        cache_dtype_str=self.cache_config.cache_dtype,
                     )
                     dtype = kv_cache_spec.dtype
-                    try:
-                        kv_cache_stride_order = attn_backend.get_kv_cache_stride_order()
-                        assert len(kv_cache_stride_order) == len(kv_cache_shape)
-                    except (AttributeError, NotImplementedError):
-                        kv_cache_stride_order = tuple(range(len(kv_cache_shape)))
-                    # The allocation respects the backend-defined stride order
-                    # to ensure the semantic remains consistent for each
-                    # backend. We first obtain the generic kv cache shape and
-                    # then permute it according to the stride order which could
-                    # result in a non-contiguous tensor.
+                    kv_cache_stride_order = layout.per_layer_stride_order
                     kv_cache_shape = tuple(
                         kv_cache_shape[i] for i in kv_cache_stride_order
                     )
@@ -6754,14 +6763,6 @@ class GPUModelRunner(
 
                     raw_tensor = kv_cache_raw_tensors[layer_name].view(dtype)
                     if kv_cache_spec.page_size_padded is not None:
-                        # Use strided view to handle page_size_bytes that
-                        # include padding. This follows
-                        # the same pattern as MambaSpec handling below.
-                        # NOTE: This assumes kv_cache_shape[0] == num_blocks
-                        # (i.e. the first physical dimension is the block
-                        # index), which holds for MLA backends but NOT for
-                        # standard attention backends whose shape starts with
-                        # a K/V dimension of size 2.
                         dtype_size = get_dtype_size(dtype)
                         page_stride = kv_cache_spec.page_size_bytes // dtype_size
                         strides = list(torch.empty(kv_cache_shape).stride())
@@ -6774,11 +6775,17 @@ class GPUModelRunner(
                     else:
                         # No padding — safe to use a contiguous view.
                         kv_cache = raw_tensor.view(kv_cache_shape)
-                    kv_caches[layer_name] = kv_cache.permute(*inv_order)
+                    kv_tensor_final = kv_cache.permute(*inv_order)
+                    # Squeeze H dim for headless specs (MLA) — backends
+                    # treat the latent as a flat (B, S, C) tensor.
+                    if kv_cache_spec.num_heads == 1:
+                        kv_tensor_final = kv_tensor_final.squeeze(-2)
+                    kv_caches[layer_name] = kv_tensor_final
 
                 elif isinstance(kv_cache_spec, MambaSpec):
                     has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
+                    base_byte_offset = raw_tensor.storage_offset()
                     state_tensors = []
                     storage_offset_bytes = 0
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
@@ -6789,12 +6796,13 @@ class GPUModelRunner(
                         target_shape = (num_blocks, *shape)
                         stride = torch.empty(target_shape).stride()
                         target_stride = (num_element_per_page, *stride[1:])
-                        assert storage_offset_bytes % dtype_size == 0
+                        abs_byte_offset = base_byte_offset + storage_offset_bytes
+                        assert abs_byte_offset % dtype_size == 0
                         tensor = torch.as_strided(
                             raw_tensor.view(dtype),
                             size=target_shape,
                             stride=target_stride,
-                            storage_offset=storage_offset_bytes // dtype_size,
+                            storage_offset=abs_byte_offset // dtype_size,
                         )
                         state_tensors.append(tensor)
                         storage_offset_bytes += stride[0] * dtype_size
@@ -6804,43 +6812,38 @@ class GPUModelRunner(
                     raise NotImplementedError
 
         if has_attn and has_mamba:
-            self._update_hybrid_attention_mamba_layout(kv_caches, kernel_block_sizes)
+            self._update_hybrid_attention_mamba_layout(kv_caches)
 
         return kv_caches
 
     def _update_hybrid_attention_mamba_layout(
-        self, kv_caches: dict[str, torch.Tensor], kernel_block_sizes: list[int]
+        self,
+        kv_caches: dict[str, torch.Tensor],
     ) -> None:
-        """
-        Update the layout of attention layers from (2, num_blocks, ...) to
-        (num_blocks, 2, ...).
+        """Ensure attention KV caches have num_blocks as the leading dim.
 
-        Args:
-            kv_caches: The KV cache buffer of each layer.
-            kernel_block_sizes: The kernel block sizes for each KV cache group.
+        Some backends may still allocate with K/V outermost; this
+        transposes to the standardized (num_blocks, ...) layout.
         """
-
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             if not isinstance(kv_cache_spec, AttentionSpec):
                 continue
-            block_dim = group.backend.get_kv_cache_block_dim(
-                kernel_block_sizes[group.kv_cache_group_id],
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-                cache_dtype_str=self.cache_config.cache_dtype,
-            )
-            # block_dim: 0 means (num_blocks, 2, ...); 1 means (2, num_blocks, ...).
-            if block_dim == 0:
-                continue
-            assert block_dim == 1
             for layer_name in group.layer_names:
                 kv_cache = kv_caches[layer_name]
-                hidden_size = kv_cache.shape[2:].numel()
-                kv_cache.as_strided_(
-                    size=kv_cache.shape,
-                    stride=(hidden_size, 2 * hidden_size, *kv_cache.stride()[2:]),
-                )
+                if kv_cache.shape[0] == 2:
+                    assert kv_cache.shape[1] != 2, (
+                        f"Cannot determine layout for tensor of shape {kv_cache.shape}"
+                    )
+                    hidden_size = kv_cache.shape[2:].numel()
+                    kv_cache.as_strided_(
+                        size=kv_cache.shape,
+                        stride=(
+                            hidden_size,
+                            2 * hidden_size,
+                            *kv_cache.stride()[2:],
+                        ),
+                    )
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
@@ -6857,29 +6860,13 @@ class GPUModelRunner(
             corresponding memory buffer for KV cache.
         """
 
-        # Try creating KV caches optimized for kv-connector transfers
-        cache_dtype = self.cache_config.cache_dtype
-        if self.use_uniform_kv_cache(self.attn_groups, cache_dtype):
-            kv_caches, cross_layers_kv_cache, attn_backend = (
-                self.allocate_uniform_kv_caches(
-                    kv_cache_config,
-                    self.attn_groups,
-                    cache_dtype,
-                    self.device,
-                    kernel_block_sizes,
-                )
-            )
-            self.cross_layers_kv_cache = cross_layers_kv_cache
-            self.cross_layers_attn_backend = attn_backend
-        else:
-            # Fallback to the general case
-            # Initialize the memory buffer for KV cache
-            kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        # Initialize the memory buffer for KV cache
+        kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
 
-            # Change the memory buffer to the desired shape
-            kv_caches = self._reshape_kv_cache_tensors(
-                kv_cache_raw_tensors, kernel_block_sizes
-            )
+        # Change the memory buffer to the desired shape
+        kv_caches = self._reshape_kv_cache_tensors(
+            kv_cache_raw_tensors, kernel_block_sizes
+        )
 
         # Set up cross-layer KV cache sharing
         for layer_name, target_layer_name in self.shared_kv_cache_layers.items():
@@ -6975,13 +6962,7 @@ class GPUModelRunner(
 
         if has_kv_transfer_group() and not is_profiling:
             kv_transfer_group = get_kv_transfer_group()
-            if self.cross_layers_kv_cache is not None:
-                assert self.cross_layers_attn_backend is not None
-                kv_transfer_group.register_cross_layers_kv_cache(
-                    self.cross_layers_kv_cache, self.cross_layers_attn_backend
-                )
-            else:
-                kv_transfer_group.register_kv_caches(kv_caches)
+            kv_transfer_group.register_kv_caches(kv_caches)
             kv_transfer_group.set_host_xfer_buffer_ops(copy_kv_blocks)
 
     def _get_attention_kv_cache_gid(self) -> int:

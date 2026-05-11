@@ -472,32 +472,20 @@ def _nvfp4_split_data_scale(
 def nvfp4_kv_cache_split_views(kv_cache: torch.Tensor) -> tuple[tuple, tuple]:
     """Split an NVFP4 KV cache tensor into data and scale views.
 
-    Accepts either a 5D tensor ``(num_pages, 2, dim_2, dim_3, full_dim)``
-    or a 4D single-side tensor ``(num_pages, dim_2, dim_3, full_dim)``.
-
-    Per-page layout: [K_data | K_scale | V_data | V_scale].
-    Each KV side is self-contained (data followed by its scale), so the
-    5D case simply splits each side independently.
-
-    The returned views are in the same dim order as the input (NHD or
-    HND), so callers get views matching whichever order they passed in.
+    Accepts a 4D tensor ``(B, N, H, C)`` where the last dimension
+    contains K and V packed: ``C = full_dim_k + full_dim_v``.
+    Each KV side is self-contained (data followed by its scale).
 
     Args:
-        kv_cache: 5D or 4D uint8 tensor where the last dimension is
-            ``full_dim = data_dim + scale_dim = 9 * head_size / 16``.
+        kv_cache: 4D uint8 tensor where the last dimension is
+            ``2 * full_dim`` with ``full_dim = 9 * head_size / 16``.
 
     Returns:
-        For 5D input:
-            ``(k_data, v_data), (k_scale, v_scale)``
-        For 4D input (single KV side):
-            ``(data,), (scale,)``
+        ``(k_data, v_data), (k_scale, v_scale)``
     """
-    if kv_cache.dim() == 4:
-        data, scale = _nvfp4_split_data_scale(kv_cache)
-        return (data,), (scale,)
-
-    k_data, k_scale = _nvfp4_split_data_scale(kv_cache[:, 0])
-    v_data, v_scale = _nvfp4_split_data_scale(kv_cache[:, 1])
+    full_dim = kv_cache.shape[-1] // 2
+    k_data, k_scale = _nvfp4_split_data_scale(kv_cache[..., :full_dim])
+    v_data, v_scale = _nvfp4_split_data_scale(kv_cache[..., full_dim:])
     return (k_data, v_data), (k_scale, v_scale)
 
 

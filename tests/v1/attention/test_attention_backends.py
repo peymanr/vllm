@@ -136,41 +136,34 @@ def create_and_prepopulate_kv_cache(
     block_table = common_attn_metadata.block_table_tensor
     slot_mapping = common_attn_metadata.slot_mapping
 
-    # Create KV cache and populate in (2, num_blocks, ...) layout for easy
-    # flat indexing, then transpose to (num_blocks, 2, ...) layout.
+    # Standardized 4D KV cache: (num_blocks, block_size, num_kv_heads, 2*head_size)
+    # K and V are packed along the last dimension (C_elements).
     kv_cache = torch.zeros(
-        2, num_blocks, block_size, num_kv_heads, head_size, dtype=dtype, device=device
+        num_blocks, block_size, num_kv_heads, 2 * head_size, dtype=dtype, device=device
     )
-    kv_cache_flat = kv_cache.view(2, -1, num_kv_heads, head_size)
+    # Flat view for easy per-token indexing:
+    # (num_blocks*block_size, num_kv_heads, 2*head_size)
+    kv_cache_flat = kv_cache.view(-1, num_kv_heads, 2 * head_size)
 
-    # Populate the cache with the context tokens
-    # Start from block_id=1 since block_id=0 is considered the null block
     start_block_idx = 1
     for i in range(batch_size):
         k_context, v_context = k_contexts[i], v_contexts[i]
         start = start_block_idx * block_size
         end = start + k_context.shape[0]
-        kv_cache_flat[0, start:end, ...] = k_context
-        kv_cache_flat[1, start:end, ...] = v_context
+        kv_cache_flat[start:end, :, :head_size] = k_context
+        kv_cache_flat[start:end, :, head_size:] = v_context
 
-        # Stay block aligned and allocate enough blocks for the new tokens
         start_block_idx += cdiv(int(seq_lens[i]), block_size)
-
-    # Transpose to (num_blocks, 2, ...) layout
-    kv_cache = kv_cache.transpose(0, 1).contiguous()
 
     blocks_end = start_block_idx
 
     # Permute the context blocks (excluding block 0 which is null)
     if randomize_blocks:
-        # Random permutation starting from block 1
         perm = torch.randperm(blocks_end - 1) + 1
     else:
-        # Sequential order starting from block 1
         perm = torch.arange(1, blocks_end)
 
     inv_perm = torch.zeros(blocks_end, dtype=torch.long, device=device)
-    # Add 1 to account for starting from block 1
     inv_perm[1:] = torch.argsort(perm) + 1
     kv_cache[1:blocks_end, ...] = kv_cache[perm, ...]
 
@@ -477,19 +470,16 @@ def _test_backend_correctness(
     # Note: flex_attention has known Triton kernel compatibility issues
     # with test infrastructures
     for backend_name in backend_to_test:
-        # KV cache is created in (num_blocks, 2, ...) layout.
-        # Backends still using (2, num_blocks, ...) need a transpose.
+        # Logical KV layout is canonical from kv_cache_spec; physical views
+        # only adjust strides below (FLASHINFER HND workaround, etc.).
         kv_cache_for_backend = kv_cache
         reset_kv_cache_layout = False
-        if hasattr(backend_name, "get_class"):
-            backend_cls = backend_name.get_class()
-            if backend_cls.get_kv_cache_shape(1, 16, 1, 128)[0] != 1:
-                kv_cache_for_backend = kv_cache.transpose(0, 1)
 
         if backend_name == AttentionBackendEnum.FLASHINFER:
-            # For FlashInfer default to HND layout and
+            # FlashInfer requires KV cache physically contiguous in HND order.
+            # Permute NHD→HND, make contiguous, then permute back to NHD view.
             kv_cache_for_backend = (
-                kv_cache_for_backend.transpose(2, 3).contiguous().transpose(2, 3)
+                kv_cache.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
             )
             set_kv_cache_layout("HND")
             reset_kv_cache_layout = True
