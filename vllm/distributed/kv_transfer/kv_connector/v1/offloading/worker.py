@@ -133,6 +133,7 @@ class OffloadingConnectorWorker:
                             .view(-1)[offset : offset + layer_bytes]
                             .view(2, num_blocks, half_page_size)
                         )
+                        # Unbind to separate K and V tensors.
                         tensors_per_block[layer_name] = tuple(raw.unbind(0))
 
                         page_size_bytes[layer_name] = half_page_size
@@ -143,6 +144,8 @@ class OffloadingConnectorWorker:
                     state_tensors = kv_caches[layer_name]
                     assert isinstance(state_tensors, list)
 
+                    # Re-construct the raw (num_blocks, page_size) tensor
+                    # from the first state tensor.
                     assert len(state_tensors) > 0
                     first_state_tensor = state_tensors[0]
                     st = first_state_tensor.untyped_storage()

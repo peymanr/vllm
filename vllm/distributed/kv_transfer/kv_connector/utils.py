@@ -447,6 +447,7 @@ class TransferTopology:
 
     @property
     def split_k_and_v(self) -> bool:
+        # Whether to register regions for K and V separately (when present).
         return not (self.is_mla or self.is_kv_layout_blocks_first)
 
     # ============================================================

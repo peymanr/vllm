@@ -145,6 +145,8 @@ def create_and_prepopulate_kv_cache(
     # (num_blocks*block_size, num_kv_heads, 2*head_size)
     kv_cache_flat = kv_cache.view(-1, num_kv_heads, 2 * head_size)
 
+    # Populate the cache with the context tokens.
+    # Start from block_id=1 since block_id=0 is considered the null block.
     start_block_idx = 1
     for i in range(batch_size):
         k_context, v_context = k_contexts[i], v_contexts[i]
