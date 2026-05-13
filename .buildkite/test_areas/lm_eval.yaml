@@ -5,7 +5,6 @@ steps:
 - label: LM Eval Small Models
   key: lm-eval-small-models
   timeout_in_minutes: 75
-  device: h200_18gb
   source_file_dependencies:
   - csrc/
   - vllm/model_executor/layers/quantization
@@ -155,7 +154,6 @@ steps:
 
 - label: MRCR Eval Small Models
   timeout_in_minutes: 30
-  device: h200_18gb
   source_file_dependencies:
   - tests/evals/mrcr/
   commands:
