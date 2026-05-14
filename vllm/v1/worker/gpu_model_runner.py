@@ -6722,7 +6722,6 @@ class GPUModelRunner(
 
             layout = resolve_kv_cache_layout()
         kv_caches: dict[str, torch.Tensor] = {}
-        has_attn, has_mamba = False, False
         for group in self._kv_cache_spec_attn_group_iterator():
             kv_cache_spec = group.kv_cache_spec
             if group.kv_cache_group_id == len(kernel_block_sizes):
@@ -6736,7 +6735,6 @@ class GPUModelRunner(
                 assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
-                    has_attn = True
                     num_blocks_per_kv_block = (
                         kv_cache_spec.block_size // kernel_block_size
                     )
@@ -6792,7 +6790,6 @@ class GPUModelRunner(
                     kv_caches[layer_name] = kv_tensor_final
 
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    has_mamba = True
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     base_byte_offset = raw_tensor.storage_offset()
                     state_tensors = []
@@ -6820,39 +6817,7 @@ class GPUModelRunner(
                 else:
                     raise NotImplementedError
 
-        if has_attn and has_mamba:
-            self._update_hybrid_attention_mamba_layout(kv_caches)
-
         return kv_caches
-
-    def _update_hybrid_attention_mamba_layout(
-        self,
-        kv_caches: dict[str, torch.Tensor],
-    ) -> None:
-        """Ensure attention KV caches have num_blocks as the leading dim.
-
-        Some backends may still allocate with K/V outermost; this
-        transposes to the standardized (num_blocks, ...) layout.
-        """
-        for group in self._kv_cache_spec_attn_group_iterator():
-            kv_cache_spec = group.kv_cache_spec
-            if not isinstance(kv_cache_spec, AttentionSpec):
-                continue
-            for layer_name in group.layer_names:
-                kv_cache = kv_caches[layer_name]
-                if kv_cache.shape[0] == 2:
-                    assert kv_cache.shape[1] != 2, (
-                        f"Cannot determine layout for tensor of shape {kv_cache.shape}"
-                    )
-                    hidden_size = kv_cache.shape[2:].numel()
-                    kv_cache.as_strided_(
-                        size=kv_cache.shape,
-                        stride=(
-                            hidden_size,
-                            2 * hidden_size,
-                            *kv_cache.stride()[2:],
-                        ),
-                    )
 
     def initialize_kv_cache_tensors(
         self, kv_cache_config: KVCacheConfig, kernel_block_sizes: list[int]
