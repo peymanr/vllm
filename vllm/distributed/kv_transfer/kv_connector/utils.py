@@ -408,8 +408,10 @@ class TransferTopology:
 
         self._engines: dict[EngineId, EngineTransferInfo] = {}
 
-        # All standardized backends use num_blocks-first layouts.
-        self._is_kv_layout_blocks_first = True
+        # With the new packed layout (B, N, H, 2D) K/V are interleaved
+        # in the last dim, not stored as separate sequential halves within
+        # a page.  Transfers must move entire pages atomically.
+        self._is_kv_layout_blocks_first = False
 
     # ============================================================
     # Engine registration
@@ -447,8 +449,9 @@ class TransferTopology:
 
     @property
     def split_k_and_v(self) -> bool:
-        # Whether to register regions for K and V separately (when present).
-        return not (self.is_mla or self.is_kv_layout_blocks_first)
+        # K and V are packed in the content dimension of the standardized
+        # 4D layout and cannot be addressed as separate contiguous regions.
+        return False
 
     # ============================================================
     # Common methods

@@ -1576,8 +1576,6 @@ class FlashInferImpl(AttentionImpl):
                 block_tables_prefill = attn_metadata.prefill.block_tables
                 seq_lens_prefill = attn_metadata.prefill.seq_lens
 
-                # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
-                assert get_kv_cache_layout() == "HND"
                 assert is_strictly_contiguous(prefill_query)
                 assert is_strictly_contiguous(workspace_buffer)
                 assert is_strictly_contiguous(block_tables_prefill)
@@ -1743,8 +1741,6 @@ class FlashInferImpl(AttentionImpl):
                 block_tables_decode = attn_metadata.decode.block_tables
                 seq_lens_decode = attn_metadata.decode.seq_lens
 
-                # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
-                assert get_kv_cache_layout() == "HND"
                 assert is_strictly_contiguous(decode_query)
                 assert is_strictly_contiguous(workspace_buffer)
                 assert is_strictly_contiguous(block_tables_decode)

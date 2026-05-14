@@ -148,6 +148,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheSpec,
     MambaSpec,
+    MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
     compute_kv_cache_shape,
@@ -6780,8 +6782,12 @@ class GPUModelRunner(
                         kv_cache = raw_tensor.view(kv_cache_shape)
                     kv_tensor_final = kv_cache.permute(*inv_order)
                     # Squeeze H dim for headless specs (MLA) — backends
-                    # treat the latent as a flat (B, S, C) tensor.
-                    if kv_cache_spec.num_heads == 1:
+                    # treat the latent as a flat (B, N, C) tensor.
+                    # Do NOT squeeze for standard MQA (num_kv_heads=1);
+                    # FlashAttention still needs the 4D shape.
+                    if isinstance(
+                        kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+                    ):
                         kv_tensor_final = kv_tensor_final.squeeze(-2)
                     kv_caches[layer_name] = kv_tensor_final
 

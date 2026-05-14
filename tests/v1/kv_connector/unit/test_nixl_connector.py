@@ -1591,9 +1591,9 @@ def test_register_kv_caches(default_vllm_config, dist_init, attn_backend):
             unique_tensor.data_ptr(),
         ]
         expected_num_entries = 2
-        # With blocks-first layout, K and V get separate descriptors for
-        # hetero-TP head splitting: 2 unique regions × 2 (K/V) × num_blocks.
-        expected_blocks_count = kv_cache_config.num_blocks * 2 * 2
+        # Packed KV layout: full-page descriptors (no K/V split).
+        # 2 unique regions × num_blocks.
+        expected_blocks_count = kv_cache_config.num_blocks * 2
 
         # Execute register_kv_caches
         connector.register_kv_caches(kv_caches)
