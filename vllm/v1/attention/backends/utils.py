@@ -97,7 +97,10 @@ def resolve_kv_cache_layout() -> KVCacheLayout:
     else:
         layout_name = envs.VLLM_KV_CACHE_LAYOUT
         if layout_name is None:
-            layout_name = get_kv_connector_cache_layout()
+            try:
+                layout_name = get_kv_connector_cache_layout()
+            except (AssertionError, RuntimeError):
+                layout_name = None
         if layout_name is None:
             layout_name = "NHD"
     try:
@@ -107,7 +110,7 @@ def resolve_kv_cache_layout() -> KVCacheLayout:
             f"Unknown KV cache layout {layout_name!r}. "
             f"Valid layouts: {[m.name for m in KVCacheLayout]}"
         ) from None
-    logger.info("Resolved KV cache layout: %s", layout)
+    logger.info_once("Resolved KV cache layout: %s", layout)
     return layout
 
 

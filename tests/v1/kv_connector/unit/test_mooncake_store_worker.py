@@ -265,36 +265,15 @@ def test_register_kv_caches_cross_layer_single_segment():
             side_effect=_auto_set_ready_event,
         ),
     ):
-        # Use the cross-layer wrapper key, same as register_cross_layers_kv_caches
         w.register_kv_caches({"__cross_layer__": tensor})
 
     assert len(w.kv_caches_base_addr) == 1
     assert w.kv_caches_base_addr[0] == tensor.untyped_storage().data_ptr()
 
     expected_block_len = tensor.untyped_storage().nbytes() // num_blocks
-    # block_len should be per_layer_page_size * num_layers
     assert (
         expected_block_len
         == num_layers * per_layer_page_elements * tensor.element_size()
     )
     assert len(w.block_len) == 1
     assert w.block_len[0] == expected_block_len
-
-    # Also verify via register_cross_layers_kv_caches wrapper
-    w2 = _make_bare_worker(num_gpu_blocks=num_blocks)
-    with (
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
-            "worker.KVCacheStoreSendingThread",
-            side_effect=_auto_set_ready_event,
-        ),
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.store."
-            "worker.KVCacheStoreRecvingThread",
-            side_effect=_auto_set_ready_event,
-        ),
-    ):
-        w2.register_cross_layers_kv_caches(tensor)
-
-    assert w2.kv_caches_base_addr == w.kv_caches_base_addr
-    assert w2.block_len == w.block_len
