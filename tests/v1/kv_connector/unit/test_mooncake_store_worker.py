@@ -265,6 +265,7 @@ def test_register_kv_caches_cross_layer_single_segment():
             side_effect=_auto_set_ready_event,
         ),
     ):
+        # Use the cross-layer wrapper key, same as register_cross_layers_kv_caches
         w.register_kv_caches({"__cross_layer__": tensor})
 
     assert len(w.kv_caches_base_addr) == 1

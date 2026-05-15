@@ -97,8 +97,8 @@ def dequant_nvfp4_kv_cache(
 ) -> torch.Tensor:
     """Dequantize an NVFP4 KV cache with 4x4-swizzled block scales.
 
-    The input must be in HNC layout so that the last two dims are
-    (block_size, last_dim).  For NHC caches, permute to HNC first.
+    The input must be in HND layout so that the last two dims are
+    (block_size, last_dim).  For NHD caches, permute to HND first.
 
     Args:
         fp4_data: [..., num_heads, block_size, head_size//2] uint8 packed fp4.
