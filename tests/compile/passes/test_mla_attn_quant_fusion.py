@@ -47,10 +47,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.kv_cache_interface import (
-    MLAAttentionSpec,
-    compute_kv_cache_shape,
-)
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
@@ -153,17 +150,11 @@ class MLAAttentionQuantPatternModel(torch.nn.Module):
         max_blocks = (max(batch_spec.seq_lens) + self.block_size - 1) // self.block_size
         num_blocks = batch_size * max_blocks
 
-        kv_cache_shape = compute_kv_cache_shape(
-            MLAAttentionSpec(
-                block_size=self.block_size,
-                num_kv_heads=1,
-                head_size=self.head_size,
-                dtype=self.kv_cache_dtype,
-            ),
-            num_blocks,
-        )
+        # MLA KV cache is 3D: (num_blocks, block_size, head_size)
         kv_cache = torch.zeros(
-            kv_cache_shape, dtype=self.kv_cache_dtype, device=self.device
+            (num_blocks, self.block_size, self.head_size),
+            dtype=self.kv_cache_dtype,
+            device=self.device,
         )
 
         self.mla_attn.kv_cache = kv_cache

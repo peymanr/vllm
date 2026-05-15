@@ -74,7 +74,7 @@ def make_nvfp4_kv_cache(
         kv_scale_val, dtype=torch.float32, device=kv_bf16_hnd.device
     )
 
-    # Allocate in HNC physical order, permute to NHC logical order.
+    # Allocate in HND physical order, permute to NHD logical order.
     # hnd_order swaps dims 2↔3; it is its own inverse.
     full_dim = nvfp4_kv_cache_full_dim(head_size)
     hnd_order = (0, 1, 3, 2, 4)
@@ -84,7 +84,7 @@ def make_nvfp4_kv_cache(
         device=kv_bf16_hnd.device,
     ).permute(*hnd_order)
 
-    # Flatten NHC [N, T, H, C] → token tensors [N*T, H, C] for the kernel.
+    # Flatten NHD [N, T, H, D] → token tensors [N*T, H, D] for the kernel.
     num_tokens = num_blocks * block_size
     k_tokens = (
         kv_bf16_hnd[:, 0]
@@ -111,7 +111,7 @@ def make_nvfp4_kv_cache(
         kv_scale_tensor,
     )
 
-    # Split in HNC order for trtllm kernel (expects HNC numTokensPerPage).
+    # Split in HND order for trtllm kernel (expects HND numTokensPerPage).
     kv_cache_hnd = kv_cache.permute(*hnd_order)
     (k_data, v_data), (k_scales, v_scales) = nvfp4_kv_cache_split_views(kv_cache_hnd)
 
@@ -163,7 +163,7 @@ BATCH_SIZE = [4, 12]
 MAX_SEQ_LENS = [(1024, 4096)]
 NUM_HEADS = [(64, 8), (40, 8)]
 HEAD_SIZE = [128]
-KV_LAYOUT = ["HNC"]  # currently only HNC is supported
+KV_LAYOUT = ["HND"]  # currently only HND is supported
 BLOCK_SIZE = [16]
 WINDOW_LEFT = [-1, 127]
 SOFT_CAP = [None, 50.0]
@@ -213,9 +213,9 @@ def test_flashinfer_trtllm_decode_with_baseline(
     sm_scale = float(1.0 / (head_size**0.5))
 
     kv_cache_shape = None
-    if kv_layout == "NHC":
+    if kv_layout == "NHD":
         kv_cache_shape = (NUM_BLOCKS, 2, block_size, num_kv_heads, head_size)
-    elif kv_layout == "HNC":
+    elif kv_layout == "HND":
         kv_cache_shape = (NUM_BLOCKS, 2, num_kv_heads, block_size, head_size)
     else:
         raise ValueError(f"Invalid kv_layout: {kv_layout}")
@@ -407,9 +407,9 @@ def test_flashinfer_trtllm_prefill_with_baseline(
     sm_scale = float(1.0 / (head_size**0.5))
 
     kv_cache_shape = None
-    if kv_layout == "NHC":
+    if kv_layout == "NHD":
         kv_cache_shape = (NUM_BLOCKS, 2, block_size, num_kv_heads, head_size)
-    elif kv_layout == "HNC":
+    elif kv_layout == "HND":
         kv_cache_shape = (NUM_BLOCKS, 2, num_kv_heads, block_size, head_size)
     else:
         raise ValueError(f"Invalid kv_layout: {kv_layout}")

@@ -39,8 +39,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.fa_utils import flash_attn_supports_mla
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
-from vllm.v1.kv_cache_interface import compute_kv_cache_shape
 
 INDEX_SELECT_OP = torch.ops.aten.index.Tensor
 VLLM_UNIFIED_MLA_KV_CACHE_UPDATE_OP = torch.ops.vllm.unified_mla_kv_cache_update
@@ -149,9 +147,8 @@ class MLARoPEKVCacheCatTestModel(torch.nn.Module):
         )
 
         # Initialize attn MetadataBuilder
-        self.kv_cache_spec = self.mla_attn.get_kv_cache_spec(vllm_config)
         self.builder = self.attn_backend.get_builder_cls()(
-            kv_cache_spec=self.kv_cache_spec,
+            kv_cache_spec=self.mla_attn.get_kv_cache_spec(vllm_config),
             layer_names=[self.mla_attn.layer_name],
             vllm_config=vllm_config,
             device=device,
@@ -168,24 +165,14 @@ class MLARoPEKVCacheCatTestModel(torch.nn.Module):
         max_blocks = (max(batch_spec.seq_lens) + self.block_size - 1) // self.block_size
         num_blocks = batch_size * max_blocks
 
-        kv_cache_shape = compute_kv_cache_shape(self.kv_cache_spec, num_blocks)
-        layout = resolve_kv_cache_layout()
-        kv_cache_stride_order = layout.per_layer_stride_order
-
-        physical_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
-        inv_order = [
-            kv_cache_stride_order.index(i) for i in range(len(kv_cache_stride_order))
-        ]
-
-        from math import prod
-
-        raw_tensor = torch.zeros(
-            prod(physical_shape),
+        # MLA uses a 3D KV cache: (num_blocks, block_size, head_size)
+        # with num_kv_heads=1 folded into head_size. No layout permutation.
+        kv_cache_shape = (num_blocks, self.block_size, self.head_size)
+        kv_cache = torch.zeros(
+            kv_cache_shape,
             dtype=self.kv_cache_dtype,
             device=self.device,
         )
-        raw_tensor = raw_tensor.view(physical_shape)
-        kv_cache = raw_tensor.permute(*inv_order)
 
         self.mla_attn.kv_cache = kv_cache
 

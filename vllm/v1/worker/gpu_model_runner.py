@@ -6655,15 +6655,15 @@ class GPUModelRunner(
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             num_slots = len(kv_cache_tensor.shared_by)
+            assert num_slots > 0, "KVCacheTensor.shared_by must have at least one slot"
             buf = torch.zeros(
                 kv_cache_tensor.size, dtype=torch.int8, device=self.device
             )
-            if num_slots > 0:
-                slot_size = kv_cache_tensor.size // num_slots
-                for slot_idx, slot_layers in enumerate(kv_cache_tensor.shared_by):
-                    slot_view = buf[slot_idx * slot_size : (slot_idx + 1) * slot_size]
-                    for layer_name in slot_layers:
-                        kv_cache_raw_tensors[layer_name] = slot_view
+            slot_size = kv_cache_tensor.size // num_slots
+            for slot_idx, slot_layers in enumerate(kv_cache_tensor.shared_by):
+                slot_view = buf[slot_idx * slot_size : (slot_idx + 1) * slot_size]
+                for layer_name in slot_layers:
+                    kv_cache_raw_tensors[layer_name] = slot_view
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
