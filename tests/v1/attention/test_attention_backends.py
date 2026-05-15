@@ -473,17 +473,17 @@ def _test_backend_correctness(
     # with test infrastructures
     for backend_name in backend_to_test:
         # Logical KV layout is canonical from kv_cache_spec; physical views
-        # only adjust strides below (FLASHINFER HND workaround, etc.).
+        # only adjust strides below (FLASHINFER HNC workaround, etc.).
         kv_cache_for_backend = kv_cache
         reset_kv_cache_layout = False
 
         if backend_name == AttentionBackendEnum.FLASHINFER:
-            # FlashInfer requires KV cache physically contiguous in HND order.
-            # Permute NHD→HND, make contiguous, then permute back to NHD view.
+            # FlashInfer requires KV cache physically contiguous in HNC order.
+            # Permute NHC→HNC, make contiguous, then permute back to NHC view.
             kv_cache_for_backend = (
                 kv_cache.permute(0, 2, 1, 3).contiguous().permute(0, 2, 1, 3)
             )
-            set_kv_cache_layout("HND")
+            set_kv_cache_layout("HNC")
             reset_kv_cache_layout = True
         elif backend_name == AttentionBackendEnum.TRITON_ATTN:
             kv_cache_for_backend = kv_cache_for_backend.contiguous()

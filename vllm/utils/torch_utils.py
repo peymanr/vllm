@@ -429,7 +429,7 @@ def _nvfp4_split_data_scale(
     Args:
         kv_side: 4D uint8 tensor with shape
             ``(num_pages, dim_1, dim_2, full_dim)``.
-            May be in any permutation order (NHD or HND).
+            May be in any permutation order (NHC or HNC).
 
     Returns:
         ``(data, scale)`` where
@@ -449,7 +449,7 @@ def _nvfp4_split_data_scale(
 
     # Derive inner strides from the kv_side strides, scaling by the
     # ratio of the target dim to full_dim.  This preserves the physical
-    # layout (NHD vs HND) encoded in the input tensor's strides.
+    # layout (NHC vs HNC) encoded in the input tensor's strides.
     s1 = kv_side.stride(1) * data_dim // full_dim
     s2 = kv_side.stride(2) * data_dim // full_dim
     data_shape = (num_pages, dim_1, dim_2, data_dim)
@@ -499,14 +499,14 @@ def create_kv_caches_with_random_flash(
     model_dtype: str | torch.dtype | None = None,
     seed: int | None = None,
     device: str | None = "cuda",
-    cache_layout: str | None = "NHD",
+    cache_layout: str | None = "NHC",
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     set_random_seed(seed)
 
     dtype = get_kv_cache_torch_dtype(cache_dtype, model_dtype)
     generic_kv_cache_shape = (num_blocks, 2, block_size, num_heads, head_size)
-    assert cache_layout in ("NHD", "HND")
-    stride_order = (0, 1, 2, 3, 4) if cache_layout == "NHD" else (0, 1, 3, 2, 4)
+    assert cache_layout in ("NHC", "HNC")
+    stride_order = (0, 1, 2, 3, 4) if cache_layout == "NHC" else (0, 1, 3, 2, 4)
 
     kv_cache_allocation_shape = tuple(generic_kv_cache_shape[i] for i in stride_order)
     scale = head_size**-0.5

@@ -43,15 +43,18 @@ from vllm.v1.attention.backend import (
 logger = init_logger(__name__)
 
 # Deprecated: use resolve_kv_cache_layout() instead (RFC #42082).
-KVCacheLayoutType = Literal["NHD", "HND", "BLNHC", "BHLNC"]
+KVCacheLayoutType = Literal["NHC", "HNC", "BLNHC", "BHLNC"]
 _KV_CACHE_LAYOUT_OVERRIDE: KVCacheLayoutType | None = None
 
 PAD_SLOT_ID = -1
 NULL_BLOCK_ID = 0
 
 
+_LAYOUT_COMPAT_ALIASES = {"NHD": "NHC", "HND": "HNC"}
+
+
 def is_valid_kv_cache_layout(value: str) -> bool:
-    return value in KVCacheLayout.__members__
+    return value in KVCacheLayout.__members__ or value in _LAYOUT_COMPAT_ALIASES
 
 
 @functools.lru_cache
@@ -88,7 +91,7 @@ def resolve_kv_cache_layout() -> KVCacheLayout:
       1. Runtime override (set_kv_cache_layout, used by tests)
       2. VLLM_KV_CACHE_LAYOUT env var (user override)
       3. Connector's get_required_kvcache_layout() preference
-      4. "NHD" fallback (identity stride order)
+      4. "HNC" fallback
     """
     global _KV_CACHE_LAYOUT_OVERRIDE
     layout_name: str | None
@@ -102,7 +105,8 @@ def resolve_kv_cache_layout() -> KVCacheLayout:
             except (AssertionError, RuntimeError):
                 layout_name = None
         if layout_name is None:
-            layout_name = "NHD"
+            layout_name = "HNC"
+    layout_name = _LAYOUT_COMPAT_ALIASES.get(layout_name, layout_name)
     try:
         layout = KVCacheLayout[layout_name]
     except KeyError:

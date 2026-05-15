@@ -330,7 +330,7 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
             vllm_config (VllmConfig): the vllm config.
 
         Returns:
-            str: the required KV cache layout. e.g. HND, or NHD.
+            str: the required KV cache layout. e.g. HNC, or NHC.
             None if the connector does not require a specific layout.
         """
 
@@ -339,9 +339,9 @@ class ExampleHiddenStatesConnector(KVConnectorBase_V1):
                 "get_required_kvcache_layout should not be called "
                 "on the abstract base class"
             )
-        # NHD means we have (num_tokens, num_heads)
-        # HND means we have (num_heads, num_tokens)
-        # For now, we only support NHD layout since this keeps the
+        # NHC means we have (num_tokens, num_heads)
+        # HNC means we have (num_heads, num_tokens)
+        # For now, we only support NHC layout since this keeps the
         # hidden states for each token together in memory.
-        # HND is primarily used when sharding heads across devices.
-        return "NHD"
+        # HNC is primarily used when sharding heads across devices.
+        return "NHC"

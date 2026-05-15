@@ -32,7 +32,7 @@ BlockIds = tuple[list[int], ...] | list[list[int]]
 
 
 def get_kv_connector_cache_layout():
-    # NOTE (NickLucche) When running disaggregated PD with NIXL, HND layout is
+    # NOTE (NickLucche) When running disaggregated PD with NIXL, HNC layout is
     # used for faster transfer.
     vllm_config = get_current_vllm_config()
     kv_config = vllm_config.kv_transfer_config
@@ -42,9 +42,9 @@ def get_kv_connector_cache_layout():
         if required_kvcache_layout is not None:
             return required_kvcache_layout
         logger.info_once(
-            "Connectors do not specify a kv cache layout, defaulting to NHD."
+            "Connectors do not specify a kv cache layout, defaulting to NHC."
         )
-    return "NHD"
+    return "NHC"
 
 
 class KVOutputAggregator:
@@ -279,11 +279,11 @@ def kv_postprocess_layout_on_receive(cache, indices):
 
 def kv_postprocess_blksize_and_layout_on_receive(cache, indices, block_size_ratio):
     """
-    Transforms the layout of received KV cache to the local block_size and HND.
+    Transforms the layout of received KV cache to the local block_size and HNC.
     (Only works for local blocksize > remote blocksize)
 
-    prefill is HND, smaller block_size
-    decode(local) is NHD, larger block_size
+    prefill is HNC, smaller block_size
+    decode(local) is NHC, larger block_size
     """
     blocks_to_update = cache.index_select(0, indices)
 

@@ -1332,8 +1332,8 @@ class FlashInferImpl(AttentionImpl):
             key: shape = [num_tokens, num_kv_heads, head_size]
             value: shape = [num_tokens, num_kv_heads, head_size]
             kv_cache: KV cache tensor with different possible shapes:
-                - NHD: [num_blocks, 2, block_size, num_kv_heads, head_size]
-                - HND: [num_blocks, 2, num_kv_heads, block_size, head_size]
+                - NHC: [num_blocks, 2, block_size, num_kv_heads, head_size]
+                - HNC: [num_blocks, 2, num_kv_heads, block_size, head_size]
             attn_metadata: Metadata for attention.
         Returns:
             shape = [num_tokens, num_heads * head_size]
@@ -1465,7 +1465,7 @@ class FlashInferImpl(AttentionImpl):
             )
         kv_cache_permute = fixed
 
-        # Split K/V from the packed content dim. After HND permute we have
+        # Split K/V from the packed content dim. After HNC permute we have
         # (B, H, N, 2*hs). Reshape to (B, H, N, 2, hs) and select K/V.
         # FlashInfer requires contiguous K and V in (B, H, N, hs) layout.
         # TODO: Optimize by changing the allocation layout to avoid this copy.

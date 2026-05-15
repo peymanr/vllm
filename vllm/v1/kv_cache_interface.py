@@ -168,8 +168,8 @@ class KVCacheLayout(Enum):
     to physical (memory) order.
     """
 
-    NHD = (0, 1, 2, 3, 4)  # [L, B, N, H, C] identity
-    HND = (0, 1, 3, 2, 4)  # [L, B, H, N, C]
+    NHC = (0, 1, 2, 3, 4)  # [L, B, N, H, C] identity
+    HNC = (0, 1, 3, 2, 4)  # [L, B, H, N, C]
     BLNHC = (1, 0, 2, 3, 4)  # [B, L, N, H, C]
     BHLNC = (1, 3, 0, 2, 4)  # [B, H, L, N, C]
 
@@ -971,11 +971,24 @@ def get_kv_cache_spec_sliding_window(kv_cache_spec: KVCacheSpec) -> int | None:
 @dataclass
 class KVCacheTensor:
     """
-    A class for specifying how the workers should initialize the KV cache.
+    Specifies how workers should initialize one KV cache backing tensor.
+
+    Each ``KVCacheTensor`` corresponds to one contiguous GPU allocation
+    whose ``size`` is ``page_size * num_blocks * num_layer_slots`` bytes.
+
+    ``shared_by`` is a nested list:
+      - ``len(shared_by)`` = number of layer slots (the ``L`` dimension).
+      - ``shared_by[i]`` = layer names that alias the *same* block within
+        slot ``i`` (typically one per KV-cache group that uses this page
+        size).
+
+    Layers in the same inner list share memory because they belong to
+    different groups with independent block tables, so their block-id
+    namespaces never collide.
     """
 
-    size: int  # size of the KV cache tensor in bytes
-    shared_by: list[str]  # layer names that share the same KV cache tensor
+    size: int  # total size in bytes
+    shared_by: list[list[str]]  # shared_by[layer_idx] = [layer_names]
 
 
 @dataclass

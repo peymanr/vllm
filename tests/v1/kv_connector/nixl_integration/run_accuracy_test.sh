@@ -39,8 +39,8 @@ if [[ -n "$VLLM_SERVE_EXTRA_ARGS" ]]; then
   echo "vLLM serve extra args: $VLLM_SERVE_EXTRA_ARGS"
 fi
 
-DECODER_KV_LAYOUT=${DECODER_KV_LAYOUT:-"HND"} # Default to HND, optional NHD
-if [[ "$DECODER_KV_LAYOUT" == "NHD" ]]; then
+DECODER_KV_LAYOUT=${DECODER_KV_LAYOUT:-"HNC"} # Default to HNC, optional NHC
+if [[ "$DECODER_KV_LAYOUT" == "NHC" ]]; then
   KV_CONFIG_HETERO_LAYOUT=',"enable_permute_local_kv":"True"'
 else
   KV_CONFIG_HETERO_LAYOUT=''
@@ -149,7 +149,7 @@ run_tests_for_model() {
 
     # Build the command with or without model-specific args
     BASE_CMD="CUDA_VISIBLE_DEVICES=$GPU_ID \
-    VLLM_KV_CACHE_LAYOUT='HND' \
+    VLLM_KV_CACHE_LAYOUT='HNC' \
     UCX_NET_DEVICES=all \
     VLLM_NIXL_SIDE_CHANNEL_PORT=$SIDE_CHANNEL_PORT \
     vllm serve $model_name \

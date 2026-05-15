@@ -6642,42 +6642,28 @@ class GPUModelRunner(
         self, kv_cache_config: KVCacheConfig
     ) -> dict[str, torch.Tensor]:
         """
-        Initializes the KV cache buffer with the correct size. The buffer needs
-        to be reshaped to the desired shape before being used by the models.
-
-        When all kv_cache_tensors in a config have the same size (uniform
-        group), a single contiguous allocation is used. Cross-layer
-        contiguity is then achieved via the stride order chosen at reshape
-        time (e.g. BLNHC puts the blocks dimension outermost).
+        Allocates flat byte buffers for the KV cache.  Each ``KVCacheTensor``
+        becomes one contiguous ``int8`` allocation of ``tensor.size`` bytes,
+        then sliced into ``len(shared_by)`` equal per-layer-slot views.
 
         Args:
             kv_cache_config: The KV cache config
         Returns:
-            dict[str, torch.Tensor]: A map between layer names to their
-            corresponding memory buffer for KV cache.
+            dict[str, torch.Tensor]: layer_name -> raw byte buffer view.
         """
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
 
-        tensor_sizes = {t.size for t in kv_cache_config.kv_cache_tensors}
-        if len(tensor_sizes) == 1:
-            # Uniform group: allocate one contiguous tensor for all layers.
-            per_layer_size = tensor_sizes.pop()
-            num_layers = len(kv_cache_config.kv_cache_tensors)
-            group_tensor = torch.zeros(
-                per_layer_size * num_layers, dtype=torch.int8, device=self.device
+        for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
+            num_slots = len(kv_cache_tensor.shared_by)
+            buf = torch.zeros(
+                kv_cache_tensor.size, dtype=torch.int8, device=self.device
             )
-            for i, kv_cache_tensor in enumerate(kv_cache_config.kv_cache_tensors):
-                layer_view = group_tensor[i * per_layer_size : (i + 1) * per_layer_size]
-                for layer_name in kv_cache_tensor.shared_by:
-                    kv_cache_raw_tensors[layer_name] = layer_view
-        else:
-            # Non-uniform: allocate per kv_cache_tensor independently.
-            for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                tensor = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, device=self.device
-                )
-                for layer_name in kv_cache_tensor.shared_by:
-                    kv_cache_raw_tensors[layer_name] = tensor
+            if num_slots > 0:
+                slot_size = kv_cache_tensor.size // num_slots
+                for slot_idx, slot_layers in enumerate(kv_cache_tensor.shared_by):
+                    slot_view = buf[slot_idx * slot_size : (slot_idx + 1) * slot_size]
+                    for layer_name in slot_layers:
+                        kv_cache_raw_tensors[layer_name] = slot_view
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:

@@ -162,7 +162,7 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
-        return "HND"
+        return "HNC"
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_worker is None:

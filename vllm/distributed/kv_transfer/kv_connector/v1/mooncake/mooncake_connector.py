@@ -377,10 +377,10 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         if vllm_config.model_config.use_mla:
             return None
         logger.info_once(
-            "MooncakeConnector setting KV cache layout to HND for "
+            "MooncakeConnector setting KV cache layout to HNC for "
             "heterogeneous TP-safe KV transfer."
         )
-        return "HND"
+        return "HNC"
 
     ############################################################
     # Scheduler Side Methods

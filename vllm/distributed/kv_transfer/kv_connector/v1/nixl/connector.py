@@ -41,7 +41,6 @@ from vllm.forward_context import ForwardContext
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
@@ -94,9 +93,9 @@ class NixlConnector(KVConnectorBase_V1, SupportsHMA):
             # which fallback to the default behavior.
             return None
         logger.info_once(
-            "NixlConnector setting KV cache layout to HND for better xfer performance."
+            "NixlConnector setting KV cache layout to HNC for better xfer performance."
         )
-        return "HND"
+        return "HNC"
 
     ############################################################
     # Scheduler Side Methods

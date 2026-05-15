@@ -75,7 +75,7 @@ def _allocate_and_reshape_kv_caches(
     kv_cache_raw_tensors = runner._allocate_kv_cache_tensors(kv_cache_config)
     kernel_block_sizes = [BLOCK_SIZE] * len(kv_cache_config.kv_cache_groups)
     return runner._reshape_kv_cache_tensors(
-        kv_cache_raw_tensors, kernel_block_sizes, layout=KVCacheLayout.NHD
+        kv_cache_raw_tensors, kernel_block_sizes, layout=KVCacheLayout.NHC
     )
 
 
@@ -212,18 +212,19 @@ def test_register_kv_caches(backend):
         aligned_mamba_layer_names,
     ]
 
-    kv_cache_tensors: list[KVCacheTensor] = []
+    shared_by: list[list[str]] = []
     for i in range(GROUP_SIZE):
-        shared_by: list[str] = []
+        slot_layers: list[str] = []
         for group_layer_names in layer_groups:
             if len(group_layer_names) > i:
-                shared_by.append(group_layer_names[i])
-        kv_cache_tensors.append(
-            KVCacheTensor(
-                size=PAGE_SIZE_BYTES * NUM_BLOCKS,
-                shared_by=shared_by,
-            )
+                slot_layers.append(group_layer_names[i])
+        shared_by.append(slot_layers)
+    kv_cache_tensors: list[KVCacheTensor] = [
+        KVCacheTensor(
+            size=PAGE_SIZE_BYTES * NUM_BLOCKS * GROUP_SIZE,
+            shared_by=shared_by,
         )
+    ]
 
     kv_cache_groups = [
         KVCacheGroupSpec(layer_names=attn_layer_names, kv_cache_spec=attn_spec),
@@ -382,11 +383,11 @@ def test_register_kv_caches_uniform_type(backend):
         kv_cache_tensors=[
             KVCacheTensor(
                 size=spec_a.page_size_bytes * NUM_BLOCKS,
-                shared_by=[layer_a],
+                shared_by=[[layer_a]],
             ),
             KVCacheTensor(
                 size=spec_b.page_size_bytes * NUM_BLOCKS,
-                shared_by=[layer_b],
+                shared_by=[[layer_b]],
             ),
         ],
         kv_cache_groups=[

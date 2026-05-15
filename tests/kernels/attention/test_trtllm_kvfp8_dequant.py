@@ -35,7 +35,7 @@ def to_float8(x, dtype=None):
 
 
 def make_contiguous_kv_cache(num_blocks, num_kv_heads, block_size, head_size):
-    """Create a standard contiguous fp8 KV cache (HND layout)."""
+    """Create a standard contiguous fp8 KV cache (HNC layout)."""
     raw = torch.randn(
         num_blocks,
         2,

@@ -132,9 +132,14 @@ def init_attn_backend(
 def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
-        for layer_name in kv_cache_tensor.shared_by:
-            kv_cache_raw_tensors[layer_name] = tensor
+        num_slots = len(kv_cache_tensor.shared_by)
+        buf = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+        if num_slots > 0:
+            slot_size = kv_cache_tensor.size // num_slots
+            for slot_idx, slot_layers in enumerate(kv_cache_tensor.shared_by):
+                slot_view = buf[slot_idx * slot_size : (slot_idx + 1) * slot_size]
+                for layer_name in slot_layers:
+                    kv_cache_raw_tensors[layer_name] = slot_view
 
     layer_names = set()
     for group in kv_cache_config.kv_cache_groups:
