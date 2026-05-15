@@ -1429,15 +1429,10 @@ class FlashInferImpl(AttentionImpl):
             stride_order = resolve_kv_cache_layout().per_layer_stride_order
             kv_perm = kv_cache.permute(*stride_order)
             hs_c = self.head_size
-            B_c, H_c, N_c = kv_perm.shape[:3]
-            kv_split_c = kv_perm.view(B_c, H_c, N_c, 2, hs_c)
             output.copy_(
                 attn_metadata.cascade_wrapper.run(
                     query,
-                    (
-                        kv_split_c[:, :, :, 0, :].contiguous(),
-                        kv_split_c[:, :, :, 1, :].contiguous(),
-                    ),
+                    (kv_perm[..., :hs_c], kv_perm[..., hs_c:]),
                 )
             )
             return output
@@ -1465,16 +1460,12 @@ class FlashInferImpl(AttentionImpl):
             )
         kv_cache_permute = fixed
 
-        # Split K/V from the packed content dim. After HNC permute we have
-        # (B, H, N, 2*hs). Reshape to (B, H, N, 2, hs) and select K/V.
-        # FlashInfer requires contiguous K and V in (B, H, N, hs) layout.
-        # TODO: Optimize by changing the allocation layout to avoid this copy.
+        # Split K/V from the packed content dim via narrow — zero-copy views.
+        # FlashInfer accepts non-contiguous K/V tensors through its tuple API.
         hs = self.head_size
-        B_kv, H_kv, N_kv = kv_cache_permute.shape[:3]
-        kv_split = kv_cache_permute.view(B_kv, H_kv, N_kv, 2, hs)
         kv_cache_tuple = (
-            kv_split[:, :, :, 0, :].contiguous(),
-            kv_split[:, :, :, 1, :].contiguous(),
+            kv_cache_permute[..., :hs],
+            kv_cache_permute[..., hs:],
         )
 
         # For NVFP4, the kv_cache last dim is full_dim (data + scale packed).
@@ -1620,7 +1611,12 @@ class FlashInferImpl(AttentionImpl):
                     # and mock kv cache with BF16 KV involved in the prefill.
                     # The dequant kernel needs a contiguous 5D tensor
                     # (B, 2, H, N, hs).
-                    kv_cache_5d = kv_split.permute(0, 3, 1, 2, 4).contiguous()
+                    B_kv, H_kv, N_kv = kv_cache_permute.shape[:3]
+                    kv_cache_5d = (
+                        kv_cache_permute.view(B_kv, H_kv, N_kv, 2, hs)
+                        .permute(0, 3, 1, 2, 4)
+                        .contiguous()
+                    )
                     mock_kv_cache, mock_block_table = trtllm_prefill_attn_kvfp8_dequant(
                         kv_cache_5d,
                         block_tables_prefill,
