@@ -18,11 +18,13 @@ from vllm.logger import init_logger
 from vllm.utils.hashing import sha256_cbor, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
+    KVCacheLayout,
     KVCacheSpec,
     KVCacheTensor,
     MambaSpec,
@@ -1201,22 +1203,15 @@ def _validate_layout_compatibility(
     """Validate that the KV cache layout is compatible with tensor shapes.
 
     When a ``KVCacheTensor`` contains layers with different N (num_states),
-    H (num_heads), or C (state_content_size), the layout must place L
-    before all of {N, H, C} in physical order so that each layer-slot is
-    a contiguous byte region that can be independently reshaped.
+    H (num_heads), or C (state_content_size), the per-layer-per-block
+    content [H, N, C] must be contiguous in physical memory
+    (i.e. ``layout[0, 0, ...].is_contiguous()``).
     """
-    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
-
     layout = resolve_kv_cache_layout()
 
-    # Check whether L (logical dim 0) precedes N (2), H (3), C (4)
-    # in the physical stride order.  If so, per-layer blocks are
-    # contiguous and mismatched shapes are fine.
-    order = layout.stride_order
-    l_pos = order.index(0)
-    nhc_positions = [order.index(d) for d in (2, 3, 4)]
-    l_before_nhc = all(l_pos < p for p in nhc_positions)
-    if l_before_nhc:
+    # The per-layer-per-block content [H, N, C] is contiguous therefore
+    # these layouts are always valid.
+    if layout in (KVCacheLayout.HNC, KVCacheLayout.BLNHC):
         return
 
     layer_spec_map: dict[str, KVCacheSpec] = {}
@@ -1232,13 +1227,10 @@ def _validate_layout_compatibility(
         shapes = {(s.num_heads, s.state_content_size) for s in specs}
         if len(shapes) > 1:
             raise ValueError(
-                f"{layout.name} layout places a per-layer dimension "
-                f"(N, H, or C) before the L dimension in physical "
-                f"memory, which requires uniform (num_heads, "
-                f"state_content_size) across layers sharing a "
-                f"KVCacheTensor. Got shapes {shapes} for layers "
-                f"{all_layer_names}. Use a layout with L outermost "
-                f"(e.g. HNC, NHC, BLNHC)."
+                f"Groups {kv_cache_groups} share a KVCacheTensor but have different "
+                f" (num_heads, state_content_size) for layers {all_layer_names}. "
+                f"Use a layout where [H, N, C] is contiguous "
+                f"(e.g. VLLM_KV_CACHE_LAYOUT=HNC or VLLM_KV_CACHE_LAYOUT=BLHNC)."
             )
 
 
