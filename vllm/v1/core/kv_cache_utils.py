@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -1223,8 +1224,14 @@ def _validate_layout_compatibility(
         all_layer_names = [name for slot in tensor.shared_by for name in slot]
         if len(all_layer_names) <= 1:
             continue
-        specs = [layer_spec_map[n] for n in all_layer_names]
-        shapes = {(s.num_heads, s.state_content_size) for s in specs}
+        attn_specs = [
+            layer_spec_map[n]
+            for n in all_layer_names
+            if isinstance(layer_spec_map[n], AttentionSpec)
+        ]
+        if len(attn_specs) <= 1:
+            continue
+        shapes = {(s.num_heads, s.state_content_size) for s in attn_specs}
         if len(shapes) > 1:
             raise ValueError(
                 f"Groups {kv_cache_groups} share a KVCacheTensor but have different "
