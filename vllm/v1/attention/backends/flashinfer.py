@@ -1617,28 +1617,19 @@ class FlashInferImpl(AttentionImpl):
                     # TRTLLM prefill attention does not support BF16 Q
                     # and fp8 kv cache. So to enable prefill attention
                     # with fp8 kv cache, we can construct a mock block
-                    # and mock kv cache with BF16 KV involved in the prefill
-                    #
-                    kv_cache_permute = canonicalize_singleton_dim_strides(
-                        kv_cache_permute
-                    )
-                    kv_strides = kv_cache_permute.stride()
-                    assert (
-                        kv_strides[-1] == 1
-                        and kv_strides[-2] == kv_cache_permute.shape[-1]
-                    ), (
-                        "KV cache inner dims (block_size, head_size) must be "
-                        f"contiguous, got strides {kv_strides}"
-                    )
+                    # and mock kv cache with BF16 KV involved in the prefill.
+                    # The dequant kernel needs a contiguous 5D tensor
+                    # (B, 2, H, N, hs).
+                    kv_cache_5d = kv_split.permute(0, 3, 1, 2, 4).contiguous()
                     mock_kv_cache, mock_block_table = trtllm_prefill_attn_kvfp8_dequant(
-                        kv_cache_permute,
+                        kv_cache_5d,
                         block_tables_prefill,
                         layer._k_scale,
                         layer._v_scale,
                         attn_metadata.q_data_type,
                     )
                 else:
-                    mock_kv_cache = kv_cache_permute
+                    mock_kv_cache = kv_cache_tuple
                     mock_block_table = block_tables_prefill
 
                 trtllm_batch_context_with_kv_cache(
@@ -1745,15 +1736,6 @@ class FlashInferImpl(AttentionImpl):
                 assert is_strictly_contiguous(workspace_buffer)
                 assert is_strictly_contiguous(block_tables_decode)
                 assert is_strictly_contiguous(seq_lens_decode)
-                kv_cache_permute = canonicalize_singleton_dim_strides(kv_cache_permute)
-                kv_strides = kv_cache_permute.stride()
-                assert (
-                    kv_strides[-1] == 1 and kv_strides[-2] == kv_cache_permute.shape[-1]
-                ), (
-                    "KV cache inner dims (block_size, head_size) must be "
-                    f"contiguous, got strides {kv_strides}"
-                )
-
                 if output.dtype == FP4_DTYPE:
                     assert self.o_sf_scale is not None
                     out = FP4Tensor(
@@ -1782,7 +1764,7 @@ class FlashInferImpl(AttentionImpl):
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
                     kv_cache=(
-                        nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_permute
+                        nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple
                     ),
                     workspace_buffer=workspace_buffer,
                     block_tables=block_tables_decode,
