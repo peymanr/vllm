@@ -51,10 +51,17 @@ NULL_BLOCK_ID = 0
 
 
 _LAYOUT_COMPAT_ALIASES = {"NHD": "NHC", "HND": "HNC"}
+_FLASHINFER_LAYOUT_NAMES = {"NHC": "NHD", "HNC": "HND"}
 
 
 def is_valid_kv_cache_layout(value: str) -> bool:
     return value in KVCacheLayout.__members__ or value in _LAYOUT_COMPAT_ALIASES
+
+
+def get_flashinfer_layout_string() -> str:
+    """Return the layout name in FlashInfer's convention (NHD/HND)."""
+    name = resolve_kv_cache_layout().name
+    return _FLASHINFER_LAYOUT_NAMES.get(name, name)
 
 
 @functools.lru_cache
