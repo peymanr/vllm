@@ -1495,18 +1495,13 @@ class NixlConnectorWorker:
             self.enable_heterogeneous_attn_post_process = True
 
         # Heterogeneous TP requires head-splitting, which only works with
-        # HNC per-layer layout. MLA and replicated-KV cases don't split on
-        # heads. Mamba doesn't support heterogeneous TP.
-        # Accept any layout whose per-layer ordering is HNC (e.g. BHLNC).
-        _hnc_per_layer = KVCacheLayout.HNC.per_layer_stride_order
-        layout_is_hnc = (
-            KVCacheLayout[kv_cache_layout].per_layer_stride_order == _hnc_per_layer
-        )
+        # block-contiguous layouts (H before N, e.g. HNC / BHLNC).
+        # MLA and replicated-KV cases don't split on heads.
         if (
             abs(tp_ratio) != 1
             and not self.use_mla
             and not self.transfer_topo.is_kv_replicated(remote_engine_id)
-            and not layout_is_hnc
+            and not KVCacheLayout[kv_cache_layout].is_block_contiguous
             and not self.enable_permute_local_kv
         ):
             raise RuntimeError(

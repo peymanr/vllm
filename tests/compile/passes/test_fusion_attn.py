@@ -122,7 +122,7 @@ class AttentionQuantPatternModel(torch.nn.Module):
         )
         layout = resolve_kv_cache_layout()
         kv_cache_shape = compute_kv_cache_shape(spec, num_blocks)
-        kv_cache_stride_order = layout.per_layer_stride_order
+        kv_cache_stride_order = layout.layer_stride_order
         physical_shape = tuple(kv_cache_shape[i] for i in kv_cache_stride_order)
         inv_order = [
             kv_cache_stride_order.index(i) for i in range(len(kv_cache_stride_order))

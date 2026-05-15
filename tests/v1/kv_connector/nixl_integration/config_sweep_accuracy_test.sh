@@ -87,5 +87,11 @@ else
   echo "running with default attention backend"
 fi
 
+if [[ -n "${CROSS_LAYERS_BLOCKS:-}" ]]; then
+  echo "CROSS_LAYERS_BLOCKS is set, running with --enable-cross-layers"
+  label+=" - CROSS_LAYERS_BLOCKS enabled"
+  cmdline_args+=" --enable-cross-layers "
+fi
+
 # Run tests
 run_tests "${label}" "${cmdline_args}"

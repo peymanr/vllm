@@ -20,9 +20,13 @@ while [[ $# -gt 0 ]]; do
       ATTENTION_BACKEND="$2"
       shift 2
       ;;
+    --enable-cross-layers)
+      export VLLM_KV_CACHE_LAYOUT="BHLNC"
+      shift 1
+      ;;
     *)
       echo "Unknown option $1"
-      echo "Usage: $0 [--kv_buffer_device <cuda|cpu>] [--attention-backend <backend>]"
+      echo "Usage: $0 [--kv_buffer_device <cuda|cpu>] [--attention-backend <backend>] [--enable-cross-layers]"
       exit 1
       ;;
   esac

@@ -160,27 +160,45 @@ class KVCacheSpec:
 # ---------------------------------------------------------------------------
 
 
+# Logical dim indices in the 5D stride permutation [L, B, H, N, C].
+_DIM_L, _DIM_B, _DIM_H, _DIM_N, _DIM_C = 0, 1, 2, 3, 4
+
+
 class KVCacheLayout(Enum):
     """Physical layout descriptor for a KV cache group.
 
-    The logical shape is always [L, B, N, H, <content>] (RFC #42082).
+    The logical shape is always [L, B, H, N, <content>] (RFC #42082).
     Each member's value is a stride permutation that maps logical axes
     to physical (memory) order.
     """
 
-    NHC = (0, 1, 2, 3, 4)  # [L, B, N, H, C] identity
-    HNC = (0, 1, 3, 2, 4)  # [L, B, H, N, C]
-    BLNHC = (1, 0, 2, 3, 4)  # [B, L, N, H, C]
-    BHLNC = (1, 3, 0, 2, 4)  # [B, H, L, N, C]
+    HNC = (0, 1, 2, 3, 4)  # [L, B, H, N, C] identity
+    NHC = (0, 1, 3, 2, 4)  # [L, B, N, H, C]
+    BLNHC = (1, 0, 3, 2, 4)  # [B, L, N, H, C]
+    BHLNC = (1, 2, 0, 3, 4)  # [B, H, L, N, C]
 
     @property
     def stride_order(self) -> tuple[int, ...]:
         return self.value
 
     @property
-    def per_layer_stride_order(self) -> tuple[int, ...]:
-        """4D permutation for per-layer tensors (drops the L dimension)."""
-        return tuple(i - 1 for i in self.value if i != 0)
+    def layer_stride_order(self) -> tuple[int, ...]:
+        """4D permutation [B, H, N, C] for per-layer tensors (drops L)."""
+        assert self.is_layer_compact
+        return tuple(i - 1 for i in self.value if i != _DIM_L)
+
+    @property
+    def is_layer_compact(self) -> bool:
+        """True when the layer is compact; i.e. the L dimension is outermost."""
+        return self.value[_DIM_L] == 0
+
+    @property
+    def is_block_contiguous(self) -> bool:
+        """True when [H, N, C] is contiguous within a block.
+
+        Required by the hybrid memory allocator when groups sharing a
+        physical tensor have mismatched H, N, or C dimensions."""
+        return self.value[-3:] == (_DIM_H, _DIM_N, _DIM_C)
 
 
 def num_states_for(block_size: int, tokens_per_state: int) -> int:
@@ -195,15 +213,15 @@ def compute_kv_cache_shape(
     num_blocks: int,
     block_size: int | None = None,
 ) -> tuple[int, ...]:
-    """Return the standard 4D logical shape (B, N, H, C) for this spec.
+    """Return the standard 4D logical shape (B, H, N, C) for this spec.
 
     Physical layout permutations are applied separately via
-    ``KVCacheLayout.per_layer_stride_order``.
+    ``KVCacheLayout.layer_stride_order``.
     """
     bs = block_size if block_size is not None else spec.storage_block_size
     ns = num_states_for(bs, spec.tokens_per_state)
     c_elements = spec.state_content_size // get_dtype_size(spec.dtype)
-    return (num_blocks, ns, spec.num_heads, c_elements)
+    return (num_blocks, spec.num_heads, ns, c_elements)
 
 
 def allocate_kv_cache(
@@ -219,7 +237,7 @@ def allocate_kv_cache(
 
     Allocates a single contiguous tensor for all layers and returns
     per-layer 4D logical views whose physical layout is determined by
-    ``layout.per_layer_stride_order``. Cross-layer contiguity is
+    ``layout.layer_stride_order``. Cross-layer contiguity is
     achieved implicitly via the stride order (e.g. BLNHC puts the
     blocks dimension outermost in physical memory). (RFC #42082)
 
@@ -234,13 +252,13 @@ def allocate_kv_cache(
 
     Returns:
         List of ``num_layers`` per-layer tensors, each with logical
-        shape ``(B, N, H, C)`` and strides matching the chosen layout.
+        shape ``(B, H, N, C)`` and strides matching the chosen layout.
     """
     if dtype is None:
         dtype = spec.dtype
 
     logical_shape = compute_kv_cache_shape(spec, num_blocks, block_size)
-    stride_order = layout.per_layer_stride_order
+    stride_order = layout.layer_stride_order
     physical_shape = tuple(logical_shape[i] for i in stride_order)
     inv_order = [stride_order.index(i) for i in range(len(stride_order))]
 
@@ -748,6 +766,36 @@ class MambaSpec(KVCacheSpec):
             return self.page_size_bytes * (2 + self.num_speculative_blocks)
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
+
+    def unpack_states(
+        self, raw_tensor: torch.Tensor, num_blocks: int
+    ) -> list[torch.Tensor]:
+        """Unpack a flat raw tensor into per-state strided views.
+
+        Returns one tensor per (shape, dtype) pair in the spec, each with
+        shape ``(num_blocks, *state_shape)`` and a block-stride that
+        accounts for page padding.
+        """
+        state_tensors: list[torch.Tensor] = []
+        base_offset = raw_tensor.storage_offset()
+        byte_offset = 0
+        for shape, dtype in zip(self.shapes, self.dtypes):
+            dtype_size = get_dtype_size(dtype)
+            page_stride = self.page_size_bytes // dtype_size
+            target_shape = (num_blocks, *shape)
+            inner_strides = torch.empty(target_shape).stride()[1:]
+            abs_offset = base_offset + byte_offset
+            assert abs_offset % dtype_size == 0
+            state_tensors.append(
+                torch.as_strided(
+                    raw_tensor.view(dtype),
+                    size=target_shape,
+                    stride=(page_stride, *inner_strides),
+                    storage_offset=abs_offset // dtype_size,
+                )
+            )
+            byte_offset += torch.empty(target_shape).stride()[0] * dtype_size
+        return state_tensors
 
 
 @dataclass(frozen=True)

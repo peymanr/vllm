@@ -6654,12 +6654,14 @@ class GPUModelRunner(
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-            num_slots = len(kv_cache_tensor.shared_by)
-            assert num_slots > 0, "KVCacheTensor.shared_by must have at least one slot"
+            num_layer_slots = len(kv_cache_tensor.shared_by)
+            assert num_layer_slots > 0, (
+                "KVCacheTensor.shared_by must have at least one slot"
+            )
             buf = torch.zeros(
                 kv_cache_tensor.size, dtype=torch.int8, device=self.device
             )
-            slot_size = kv_cache_tensor.size // num_slots
+            slot_size = kv_cache_tensor.size // num_layer_slots
             for slot_idx, slot_layers in enumerate(kv_cache_tensor.shared_by):
                 slot_view = buf[slot_idx * slot_size : (slot_idx + 1) * slot_size]
                 for layer_name in slot_layers:
@@ -6738,7 +6740,7 @@ class GPUModelRunner(
                         shape_block_size,
                     )
                     dtype = kv_cache_spec.dtype
-                    kv_cache_stride_order = layout.per_layer_stride_order
+                    kv_cache_stride_order = layout.layer_stride_order
                     kv_cache_shape = tuple(
                         kv_cache_shape[i] for i in kv_cache_stride_order
                     )
@@ -6776,30 +6778,9 @@ class GPUModelRunner(
                     kv_caches[layer_name] = kv_tensor_final
 
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    raw_tensor = kv_cache_raw_tensors[layer_name]
-                    base_byte_offset = raw_tensor.storage_offset()
-                    state_tensors = []
-                    storage_offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                        dtype_size = get_dtype_size(dtype)
-                        num_element_per_page = (
-                            kv_cache_spec.page_size_bytes // dtype_size
-                        )
-                        target_shape = (num_blocks, *shape)
-                        stride = torch.empty(target_shape).stride()
-                        target_stride = (num_element_per_page, *stride[1:])
-                        abs_byte_offset = base_byte_offset + storage_offset_bytes
-                        assert abs_byte_offset % dtype_size == 0
-                        tensor = torch.as_strided(
-                            raw_tensor.view(dtype),
-                            size=target_shape,
-                            stride=target_stride,
-                            storage_offset=abs_byte_offset // dtype_size,
-                        )
-                        state_tensors.append(tensor)
-                        storage_offset_bytes += stride[0] * dtype_size
-
-                    kv_caches[layer_name] = state_tensors
+                    kv_caches[layer_name] = kv_cache_spec.unpack_states(
+                        kv_cache_raw_tensors[layer_name], num_blocks
+                    )
                 else:
                     raise NotImplementedError
 

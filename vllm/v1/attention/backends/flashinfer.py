@@ -1426,7 +1426,7 @@ class FlashInferImpl(AttentionImpl):
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
             assert attn_metadata.cascade_wrapper is not None
-            stride_order = resolve_kv_cache_layout().per_layer_stride_order
+            stride_order = resolve_kv_cache_layout().layer_stride_order
             kv_perm = kv_cache.permute(*stride_order)
             hs_c = self.head_size
             output.copy_(
@@ -1442,7 +1442,7 @@ class FlashInferImpl(AttentionImpl):
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
 
-        stride_order = resolve_kv_cache_layout().per_layer_stride_order
+        stride_order = resolve_kv_cache_layout().layer_stride_order
         kv_cache_permute = kv_cache.permute(*stride_order)
         # Fix degenerate strides on any size-1 dimension (e.g. num_kv_heads=1
         # with TP=8).  PyTorch permits non-canonical strides on size-1 dims;

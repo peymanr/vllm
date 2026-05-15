@@ -826,9 +826,10 @@ def test_init_kv_cache_without_kv_sharing(default_vllm_config):
     # this will only allocate 1 block worth of memory per slot (2 slots * 32kb)
     kv_cache_config.num_blocks = 1
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-        num_slots = len(kv_cache_tensor.shared_by)
+        num_layer_slots = len(kv_cache_tensor.shared_by)
         kv_cache_tensor.size = (
-            kv_cache_spec[kv_cache_tensor.shared_by[0][0]].page_size_bytes * num_slots
+            kv_cache_spec[kv_cache_tensor.shared_by[0][0]].page_size_bytes
+            * num_layer_slots
         )
 
     runner.initialize_kv_cache(kv_cache_config)
