@@ -447,12 +447,6 @@ class TransferTopology:
     def is_kv_layout_blocks_first(self) -> bool:
         return self._is_kv_layout_blocks_first
 
-    @property
-    def split_k_and_v(self) -> bool:
-        # K and V are packed in the content dimension of the standardized
-        # 4D layout and cannot be addressed as separate contiguous regions.
-        return False
-
     # ============================================================
     # Common methods
     # ============================================================
@@ -546,8 +540,7 @@ class TransferTopology:
             # Swap [2<>num_blocks] dims for hybrid SSM layout.
             cache = cache.transpose(0, 1)
 
-        # Regular case: backends like FA register K/V in separate regions
-        return cache if self.split_k_and_v else [cache]
+        return [cache]
 
     def describe(self, remote_engine_id: EngineId) -> str:
         """One-line summary of transfer config for logging."""

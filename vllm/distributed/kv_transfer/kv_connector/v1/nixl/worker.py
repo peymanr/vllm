@@ -1646,24 +1646,18 @@ class NixlConnectorWorker:
                 block_size_ratio,
             )
 
-        split_k_and_v = self.transfer_topo.split_k_and_v
-
         for block_ids in block_ids_list:
             indices = torch.tensor(block_ids, device=self.device_type, dtype=torch.long)
 
-            for _, cache_or_caches in self.device_kv_caches.items():
-                cache_list = cache_or_caches if split_k_and_v else [cache_or_caches]
-                for cache in cache_list:
-                    if self.enable_permute_local_kv and block_size_ratio > 1:
-                        kv_postprocess_blksize_and_layout_on_receive(
-                            cache, indices, block_size_ratio
-                        )
-                    elif self.enable_permute_local_kv:
-                        kv_postprocess_layout_on_receive(cache, indices)
-                    else:
-                        kv_postprocess_blksize_on_receive(
-                            cache, indices, block_size_ratio
-                        )
+            for _, cache in self.device_kv_caches.items():
+                if self.enable_permute_local_kv and block_size_ratio > 1:
+                    kv_postprocess_blksize_and_layout_on_receive(
+                        cache, indices, block_size_ratio
+                    )
+                elif self.enable_permute_local_kv:
+                    kv_postprocess_layout_on_receive(cache, indices)
+                else:
+                    kv_postprocess_blksize_on_receive(cache, indices, block_size_ratio)
 
     def post_process_device_kv_on_receive_heterogeneous_attn(
         self, block_ids: list[int]
