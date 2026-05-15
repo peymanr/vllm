@@ -6778,9 +6778,7 @@ class GPUModelRunner(
                     kv_caches[layer_name] = kv_tensor_final
 
                 elif isinstance(kv_cache_spec, MambaSpec):
-                    kv_caches[layer_name] = kv_cache_spec.unpack_states(
-                        kv_cache_raw_tensors[layer_name], num_blocks
-                    )
+                    kv_caches[layer_name] = kv_cache_raw_tensors[layer_name]
                 else:
                     raise NotImplementedError
 

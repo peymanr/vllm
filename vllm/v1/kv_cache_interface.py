@@ -224,6 +224,53 @@ def compute_kv_cache_shape(
     return (num_blocks, spec.num_heads, ns, c_elements)
 
 
+def reshape_kv_cache(
+    raw: torch.Tensor,
+    spec: KVCacheSpec,
+    num_blocks: int,
+    num_layers: int,
+    layout: KVCacheLayout,
+) -> list[torch.Tensor]:
+    """View a flat buffer as 5D ``[L, B, H, N, C]`` and return per-layer views.
+
+    For ``AttentionSpec``, the raw int8 buffer is reinterpreted as
+    ``spec.dtype``, viewed with the full 5D physical layout from
+    ``layout.stride_order``, then permuted back to the logical
+    ``[L, B, H, N, C]`` shape.  ``result[i]`` gives layer *i*'s 4D view.
+
+    For non-attention specs (e.g. ``MambaSpec``), returns the raw buffer
+    for each layer slot — the backend is responsible for interpreting it.
+    """
+    if not isinstance(spec, AttentionSpec):
+        layer_size = raw.numel() // num_layers
+        return [raw[i * layer_size : (i + 1) * layer_size] for i in range(num_layers)]
+
+    logical_4d = compute_kv_cache_shape(spec, num_blocks, spec.storage_block_size)
+    logical_5d = (num_layers, *logical_4d)
+    stride_order = layout.stride_order
+    physical_5d = tuple(logical_5d[i] for i in stride_order)
+    inv_order = [stride_order.index(i) for i in range(5)]
+
+    kv_tensor = raw.view(spec.dtype)
+    if spec.page_size_padded is not None:
+        dtype_size = get_dtype_size(spec.dtype)
+        page_stride = spec.page_size_bytes // dtype_size
+        strides = list(torch.empty(physical_5d).stride())
+        strides[inv_order[_DIM_B]] = page_stride
+        cache = torch.as_strided(kv_tensor, size=physical_5d, stride=tuple(strides))
+    else:
+        cache = kv_tensor.view(physical_5d)
+    cache_logical = cache.permute(*inv_order)
+
+    views: list[torch.Tensor] = []
+    for i in range(num_layers):
+        v = cache_logical[i]
+        if spec.num_heads == 1:
+            v = v.squeeze(-2)
+        views.append(v)
+    return views
+
+
 def allocate_kv_cache(
     spec: AttentionSpec,
     num_blocks: int,
@@ -235,11 +282,9 @@ def allocate_kv_cache(
 ) -> list[torch.Tensor]:
     """Allocate KV cache for a uniform group and return per-layer views.
 
-    Allocates a single contiguous tensor for all layers and returns
-    per-layer 4D logical views whose physical layout is determined by
-    ``layout.layer_stride_order``. Cross-layer contiguity is
-    achieved implicitly via the stride order (e.g. BLNHC puts the
-    blocks dimension outermost in physical memory). (RFC #42082)
+    Allocates a single contiguous tensor and uses :func:`reshape_kv_cache`
+    to produce per-layer 4D logical views whose physical layout is
+    determined by ``layout.stride_order``.
 
     Args:
         spec: KV cache spec (shared by all layers in the group).
@@ -257,23 +302,11 @@ def allocate_kv_cache(
     if dtype is None:
         dtype = spec.dtype
 
-    logical_shape = compute_kv_cache_shape(spec, num_blocks, block_size)
-    stride_order = layout.layer_stride_order
-    physical_shape = tuple(logical_shape[i] for i in stride_order)
-    inv_order = [stride_order.index(i) for i in range(len(stride_order))]
-
-    per_layer_elements = prod(physical_shape)
-    group_tensor = torch.zeros(
-        per_layer_elements * num_layers, device=device, dtype=dtype
-    )
-
-    views = []
-    for i in range(num_layers):
-        layer_flat = group_tensor[i * per_layer_elements : (i + 1) * per_layer_elements]
-        cache = layer_flat.view(physical_shape).permute(*inv_order)
-        views.append(cache)
-
-    return views
+    logical_4d = compute_kv_cache_shape(spec, num_blocks, block_size)
+    total_elements = prod(logical_4d) * num_layers
+    buf = torch.zeros(total_elements, device=device, dtype=dtype)
+    raw = buf.view(torch.int8)
+    return reshape_kv_cache(raw, spec, num_blocks, num_layers, layout)
 
 
 # ---------------------------------------------------------------------------
@@ -766,36 +799,6 @@ class MambaSpec(KVCacheSpec):
             return self.page_size_bytes * (2 + self.num_speculative_blocks)
         else:
             return self.page_size_bytes * (1 + self.num_speculative_blocks)
-
-    def unpack_states(
-        self, raw_tensor: torch.Tensor, num_blocks: int
-    ) -> list[torch.Tensor]:
-        """Unpack a flat raw tensor into per-state strided views.
-
-        Returns one tensor per (shape, dtype) pair in the spec, each with
-        shape ``(num_blocks, *state_shape)`` and a block-stride that
-        accounts for page padding.
-        """
-        state_tensors: list[torch.Tensor] = []
-        base_offset = raw_tensor.storage_offset()
-        byte_offset = 0
-        for shape, dtype in zip(self.shapes, self.dtypes):
-            dtype_size = get_dtype_size(dtype)
-            page_stride = self.page_size_bytes // dtype_size
-            target_shape = (num_blocks, *shape)
-            inner_strides = torch.empty(target_shape).stride()[1:]
-            abs_offset = base_offset + byte_offset
-            assert abs_offset % dtype_size == 0
-            state_tensors.append(
-                torch.as_strided(
-                    raw_tensor.view(dtype),
-                    size=target_shape,
-                    stride=(page_stride, *inner_strides),
-                    storage_offset=abs_offset // dtype_size,
-                )
-            )
-            byte_offset += torch.empty(target_shape).stride()[0] * dtype_size
-        return state_tensors
 
 
 @dataclass(frozen=True)
