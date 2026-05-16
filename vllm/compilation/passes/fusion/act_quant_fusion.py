@@ -37,7 +37,9 @@ silu_and_mul_nvfp4_quant_supported = current_platform.is_cuda() and hasattr(
     torch.ops._C, "silu_and_mul_nvfp4_quant"
 )
 if silu_and_mul_nvfp4_quant_supported:
-    FUSED_OPS[kNvfp4Dynamic] = torch.ops._C.silu_and_mul_nvfp4_quant.default  # noqa: E501
+    FUSED_OPS[kNvfp4Dynamic] = (
+        torch.ops._C.silu_and_mul_nvfp4_quant.default
+    )  # noqa: E501
 
 if current_platform.is_cuda_alike():
     FUSED_OPS[kFp8Dynamic128Sym] = torch.ops._C.silu_and_mul_per_block_quant.default
@@ -57,14 +59,14 @@ class ActivationQuantPattern(VllmPatternReplacement):
         self.quant_key = quant_key
         self.quant_dtype = quant_key.dtype
 
-        assert self.quant_key in QUANT_OPS, (
-            f"unsupported quantization scheme {self.quant_key}"
-        )
+        assert (
+            self.quant_key in QUANT_OPS
+        ), f"unsupported quantization scheme {self.quant_key}"
         self.QUANT_OP = QUANT_OPS[self.quant_key]
 
-        assert self.quant_key in FUSED_OPS, (
-            f"unsupported fusion scheme {self.quant_key}"
-        )
+        assert (
+            self.quant_key in FUSED_OPS
+        ), f"unsupported fusion scheme {self.quant_key}"
         self.FUSED_OP = FUSED_OPS[self.quant_key]
 
         self.silu_and_mul_matcher = MatcherSiluAndMul()
@@ -190,6 +192,7 @@ class SiluMulBlockQuantPattern(ActivationQuantPattern):
         is_scale_transposed: bool = False,
         is_e8m0: bool = False,
         is_tma_aligned: bool = False,
+        match_aiter: bool = False,
     ) -> None:
         super().__init__(quant_key)
         self.quant_matcher = MatcherQuantFP8(
