@@ -161,9 +161,9 @@ if flashinfer_comm is not None:
             dtype=allreduce_in.dtype,
             group=get_tp_group().device_group,
         )
-        assert workspace is not None, (
-            "Flashinfer allreduce workspace must be initialized when using flashinfer"
-        )
+        assert (
+            workspace is not None
+        ), "Flashinfer allreduce workspace must be initialized when using flashinfer"
         assert flashinfer_comm is not None
         if norm_out is None:
             norm_out = allreduce_in
@@ -739,6 +739,88 @@ class AllReduceFusedAddRMSNormStaticQuantNVFP4Pattern(BasePattern):
         )
 
 
+class AiterAllreduceFusedRMSNormPattern(BasePattern):
+    FUSED_AR_RMSNORM_OP = rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
+
+    def __init__(
+        self,
+        epsilon: float,
+        dtype: torch.dtype,
+        device: str | None,
+    ) -> None:
+        super().__init__(dtype, device)
+        self.epsilon = epsilon
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        return [self.empty(5, 16), self.empty(16)]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            input: torch.Tensor, weight: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            allreduce_output = tensor_model_parallel_all_reduce(input)
+            rms = vllm.ir.ops.rms_norm(allreduce_output, weight, self.epsilon)
+            return rms, allreduce_output
+
+        def replacement(
+            input: torch.Tensor, weight: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result = AiterAllreduceFusedRMSNormPattern.FUSED_AR_RMSNORM_OP(
+                input, weight, self.epsilon
+            )
+            return result, input
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+        )
+
+
+class AiterAllreduceFusedAddRMSNormPattern(BasePattern):
+    FUSED_AR_RMSNORM_OP = rocm_aiter_ops.get_fused_allreduce_rmsnorm_op()
+
+    def __init__(
+        self,
+        epsilon: float,
+        dtype: torch.dtype,
+        device: str | None,
+    ) -> None:
+        super().__init__(dtype, device)
+        self.epsilon = epsilon
+        self.rmsnorm_matcher = MatcherFusedAddRMSNorm(epsilon)
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        input, residual, weight = self.rmsnorm_matcher.inputs()
+        return [residual, input.to(self.dtype), weight]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def pattern(
+            residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            allreduce_output = tensor_model_parallel_all_reduce(input)
+            rms, residual = self.rmsnorm_matcher(allreduce_output, weight, residual)
+            return rms, residual
+
+        def replacement(
+            residual: torch.Tensor, input: torch.Tensor, weight: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result = AiterAllreduceFusedAddRMSNormPattern.FUSED_AR_RMSNORM_OP(
+                input, weight, self.epsilon
+            )
+            return result, residual
+
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+        )
+
+
 class AllReduceFusionPass(VllmPatternMatcherPass):
     def __init__(self, config: VllmConfig) -> None:
         super().__init__(config)
@@ -889,3 +971,66 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             return
         with contextlib.suppress(Exception):
             destroy_fi_ar_workspace()
+
+
+class RocmAiterAllReduceFusionPass(VllmPatternMatcherPass):
+    def __init__(self, config: VllmConfig) -> None:
+        super().__init__(config)
+        self.disabled = True
+        self.tp_size = get_tensor_model_parallel_world_size()
+        if self.tp_size <= 1:
+            logger.warning_once(
+                "RocmAiterAllReduceFusionPass is disabled for tp_size <= 1."
+            )
+            return
+        if config.model_config is None:
+            logger.warning_once(
+                "RocmAiterAllReduceFusionPass is disabled for missing model_config."
+            )
+            return
+        self.hidden_dim = config.model_config.get_hidden_size()
+        tp_group = get_tp_group()
+        ca_comm = tp_group.device_communicator
+        self.group = tp_group.device_group
+        rocm_aiter_ops.initialize_aiter_allreduce(self.group, self.device)
+        max_size = rocm_aiter_ops.get_aiter_allreduce_max_size()
+        element_size = torch.tensor([], dtype=self.model_dtype).element_size()
+        self.max_token_num = max_size // (self.hidden_dim * element_size)
+        self.patterns: PatternMatcherPass = PatternMatcherPass(
+            pass_name="rocm_aiter_all_reduce_fusion_pass"
+        )
+        self.register_patterns()
+        self.disabled = False
+
+    @enable_fake_mode
+    def register_patterns(self) -> None:
+        for epsilon in [1e-5, 1e-6]:
+            AiterAllreduceFusedRMSNormPattern(
+                epsilon,
+                self.model_dtype,
+                self.device,
+            ).register(self.patterns)
+            AiterAllreduceFusedAddRMSNormPattern(
+                epsilon,
+                self.model_dtype,
+                self.device,
+            ).register(self.patterns)
+            torch._inductor.pattern_matcher._seen_patterns.clear()
+
+    def is_applicable_for_range(self, compile_range: Range) -> bool:
+        return bool(compile_range.end <= self.max_token_num)
+
+    @VllmInductorPass.time_and_log
+    def __call__(self, graph: fx.Graph) -> None:
+        self.patterns.apply(graph)
+
+    def __del__(self) -> None:
+        rocm_aiter_ops.destroy_aiter_allreduce()
+
+    def uuid(self) -> Any:
+        import hashlib
+
+        h = hashlib.md5()
+        h.update(AiterAllreduceFusedRMSNormPattern.__name__.encode())
+        h.update(AiterAllreduceFusedAddRMSNormPattern.__name__.encode())
+        return h.hexdigest()
