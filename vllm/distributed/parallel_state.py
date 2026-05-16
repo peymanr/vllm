@@ -259,10 +259,40 @@ def patched_fused_scaled_matmul_reduce_scatter(
     )
 
 
+def fused_allreduce_rmsnorm(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._fused_allreduce_rmsnorm_out_place(input_, residual, weight, eps)
+
+
+def fused_allreduce_rmsnorm_fake(
+    input_: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(residual), torch.empty_like(residual)
+
+
 direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="fused_allreduce_rmsnorm",
+    op_func=fused_allreduce_rmsnorm,
+    fake_impl=fused_allreduce_rmsnorm_fake,
 )
 
 direct_register_custom_op(
@@ -472,6 +502,7 @@ class GroupCoordinator:
         # only cuda uses this function,
         # so we don't abstract it into the base class
         maybe_ca_context = nullcontext()
+        maybe_aiter_context = nullcontext()
         from vllm.distributed.device_communicators.cuda_communicator import (
             CudaCommunicator,
         )
@@ -482,13 +513,19 @@ class GroupCoordinator:
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
 
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            aiter_ar = rocm_aiter_ops.get_aiter_allreduce()
+            if aiter_ar is not None:
+                maybe_aiter_context = aiter_ar.capture()  # type: ignore
+
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
         curr_stream = torch.cuda.current_stream()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context:
+        with torch.cuda.stream(stream), maybe_ca_context, maybe_aiter_context:
             yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
@@ -520,14 +557,56 @@ class GroupCoordinator:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
 
+    def _fused_allreduce_rmsnorm_out_place(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.fused_allreduce_rmsnorm(
+            input_, residual, weight, eps
+        )
+
+    def fused_allreduce_rmsnorm(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused allreduce + residual-add + RMSNorm.
+
+        When world_size == 1, falls back to plain add + rmsnorm (no allreduce).
+        """
+        if self.world_size == 1:
+            from vllm.model_executor.layers.layernorm import fused_add_rms_norm
+
+            return fused_add_rms_norm(input_, residual, weight, eps)
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.fused_allreduce_rmsnorm(
+                input_,
+                residual,
+                weight,
+                eps,
+                group_name=self.unique_name,
+            )
+        else:
+            return self._fused_allreduce_rmsnorm_out_place(
+                input_, residual, weight, eps
+            )
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
 
         if self.use_custom_op_call:
             return torch.ops.vllm.all_gather(
@@ -556,9 +635,9 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if world_size == 1:
             return input_
-        assert -input_.dim() <= dim < input_.dim(), (
-            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
-        )
+        assert (
+            -input_.dim() <= dim < input_.dim()
+        ), f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
 
         if self.use_custom_op_call:
             return torch.ops.vllm.reduce_scatter(
@@ -684,9 +763,9 @@ class GroupCoordinator:
 
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        assert src != self.rank_in_group, (
-            "Invalid source rank. Source rank is the same as the current rank."
-        )
+        assert (
+            src != self.rank_in_group
+        ), "Invalid source rank. Source rank is the same as the current rank."
 
         size_tensor = torch.empty(1, dtype=torch.long, device="cpu")
 
@@ -706,9 +785,9 @@ class GroupCoordinator:
             object_tensor, src=self.ranks[src], group=self.cpu_group
         )
 
-        assert rank_object == rank_size, (
-            "Received object sender rank does not match the size sender rank."
-        )
+        assert (
+            rank_object == rank_size
+        ), "Received object sender rank does not match the size sender rank."
 
         obj = pickle.loads(object_tensor.numpy().tobytes())
 
@@ -735,9 +814,9 @@ class GroupCoordinator:
         rank_in_group = self.rank_in_group
         if rank_in_group == src:
             metadata_list: list[tuple[Any, Any]] = []
-            assert isinstance(tensor_dict, dict), (
-                f"Expecting a dictionary, got {type(tensor_dict)}"
-            )
+            assert isinstance(
+                tensor_dict, dict
+            ), f"Expecting a dictionary, got {type(tensor_dict)}"
             metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
             # `metadata_list` lives in CPU memory.
             # `broadcast_object_list` has serialization & deserialization,
@@ -866,9 +945,7 @@ class GroupCoordinator:
             if self.device_communicator is None:
                 raise ValueError("No device communicator found")
             # custom device communicator path is synchronous
-            self.device_communicator.send_tensor_dict(  # type: ignore
-                tensor_dict, dst
-            )
+            self.device_communicator.send_tensor_dict(tensor_dict, dst)  # type: ignore
             return []
 
         all_gather_size = 1 if all_gather_group is None else all_gather_group.world_size
@@ -1340,9 +1417,9 @@ def _init_elastic_ep_world(
         global_rank=global_rank,
         global_world_size=global_world_size,
     )
-    assert parallel_config.nnodes_within_dp == 1, (
-        "Elastic EP is not supported with multi-node TP/PP"
-    )
+    assert (
+        parallel_config.nnodes_within_dp == 1
+    ), "Elastic EP is not supported with multi-node TP/PP"
     _NODE_COUNT = _node_count(world.tcp_store_group)
     _WORLD = world
 
@@ -1416,9 +1493,9 @@ def init_distributed_environment(
                 "Distributed backend %s is not available; falling back to gloo.",
                 backend,
             )
-            assert torch.distributed.is_gloo_available(), (
-                "Fallback Gloo backend is not available."
-            )
+            assert (
+                torch.distributed.is_gloo_available()
+            ), "Fallback Gloo backend is not available."
             backend = "gloo"
         # this backend is used for WORLD
         torch.distributed.init_process_group(
@@ -1461,9 +1538,9 @@ def init_distributed_environment(
             _NODE_COUNT = _node_count(_WORLD.cpu_group)
         logger.debug("Detected %d nodes in the distributed environment", _NODE_COUNT)
     else:
-        assert _WORLD.world_size == torch.distributed.get_world_size(), (
-            "world group already initialized with a different world size"
-        )
+        assert (
+            _WORLD.world_size == torch.distributed.get_world_size()
+        ), "world group already initialized with a different world size"
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
         if parallel_config.data_parallel_size > 1:
             world_size_inner_dp = parallel_config.world_size
@@ -1946,9 +2023,9 @@ def in_the_same_node_as(
     memory system (shared access to shared memory).
     """
     if isinstance(pg, ProcessGroup):
-        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
-            "in_the_same_node_as should be tested with a non-NCCL group."
-        )
+        assert (
+            torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
+        ), "in_the_same_node_as should be tested with a non-NCCL group."
         # local rank inside the group
         rank = torch.distributed.get_rank(group=pg)
         world_size = torch.distributed.get_world_size(group=pg)
