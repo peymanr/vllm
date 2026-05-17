@@ -21,15 +21,15 @@ namespace vllm {
 
 // NOTE Be EXTRA careful with raw_kv_scalar_t, for __half and __nv_bfloat16 it's
 // using u16 as the backing type.
-template <typename qk_t, bool IS_NEOX, typename raw_kv_scalar_t,
-          typename cache_t, Fp8KVCacheDataType kv_dt>
+template <typename qk_t, typename cos_sin_t, bool IS_NEOX,
+          typename raw_kv_scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_rope_fused_kernel(
     const int64_t* __restrict__ positions,  // [num_tokens]
     qk_t* __restrict__ q_pe,        // [num_tokens, num_q_heads, rot_dim]
-    qk_t* __restrict__ k_pe,        // [num_tokens, rot_dim]
+    const qk_t* __restrict__ k_pe,  // [num_tokens, rot_dim] (read-only)
     const qk_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
-    const qk_t* __restrict__ rope_cos_sin_cache,  // [max_position, 2,
-                                                  // rot_dim // 2]
+    const cos_sin_t* __restrict__ rope_cos_sin_cache,  // [max_position, 2,
+                                                       // rot_dim // 2]
     const int rot_dim, const int64_t q_pe_stride_token,
     const int64_t q_pe_stride_head, const int64_t k_pe_stride,
     const int64_t kv_c_stride, const int num_q_heads,
@@ -37,12 +37,15 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
                                      // rot_dim)]
     const int64_t* __restrict__ kv_cache_slot_mapping,  // [num_tokens]
     const int block_stride, const int entry_stride, const int kv_lora_rank,
-    const int block_size, const float* kv_cache_quant_scale) {
+    const int block_size, const float* kv_cache_quant_scale,
+    qk_t* __restrict__ k_pe_out  // [num_tokens, rot_dim], contiguous (rot_dim
+                                 // is the head stride)
+) {
   // Each thread block is responsible for one token.
   const int64_t token_idx = blockIdx.x;
   const int64_t pos = positions[token_idx];
 
-  const qk_t* cos_sin_ptr = rope_cos_sin_cache + pos * rot_dim;
+  const cos_sin_t* cos_sin_ptr = rope_cos_sin_cache + pos * rot_dim;
 
   const int embed_dim = rot_dim / 2;
 
@@ -54,8 +57,8 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
 
     // NOTE: Would be nice to have interleaved sin/cos so we could just load
     // both at the same time.
-    qk_t cos = VLLM_LDG(cos_sin_ptr + pair_idx);
-    qk_t sin = VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim);
+    qk_t cos = static_cast<qk_t>(VLLM_LDG(cos_sin_ptr + pair_idx));
+    qk_t sin = static_cast<qk_t>(VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim));
 
     qk_t* q_pe_head_ptr =
         q_pe + token_idx * q_pe_stride_token + head_idx * q_pe_stride_head;
@@ -94,10 +97,10 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
   for (int i = threadIdx.x; i < embed_dim; i += blockDim.x) {
     int pair_idx = i;
 
-    qk_t cos = VLLM_LDG(cos_sin_ptr + pair_idx);
-    qk_t sin = VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim);
+    qk_t cos = static_cast<qk_t>(VLLM_LDG(cos_sin_ptr + pair_idx));
+    qk_t sin = static_cast<qk_t>(VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim));
 
-    qk_t* k_pe_head_ptr = k_pe + token_idx * k_pe_stride;
+    const qk_t* k_pe_head_ptr = k_pe + token_idx * k_pe_stride;
 
     int pair_idx_x, pair_idx_y;
     if constexpr (IS_NEOX) {
@@ -116,8 +119,12 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
     qk_t x_dst = x_src * cos - y_src * sin;
     qk_t y_dst = y_src * cos + x_src * sin;
 
-    k_pe_head_ptr[pair_idx_x] = x_dst;
-    k_pe_head_ptr[pair_idx_y] = y_dst;
+    // Write the rotated k_pe into a fresh contiguous output buffer instead
+    // of mutating the (possibly strided) input view. The kv_cache store
+    // below sees the same rotated value via the local x_dst/y_dst.
+    qk_t* k_pe_out_ptr = k_pe_out + token_idx * rot_dim;
+    k_pe_out_ptr[pair_idx_x] = x_dst;
+    k_pe_out_ptr[pair_idx_y] = y_dst;
 
     // NOTE Why is this monster necessary?
     // When K is of type float16, the actual template replacement for
@@ -169,31 +176,40 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
   do {                                                                         \
     VLLM_DISPATCH_FLOATING_TYPES(q_pe.scalar_type(), "qk_scalar_type", [&] {   \
       using qk_t = scalar_t;                                                   \
-      if (rope_is_neox) {                                                      \
-        vllm::concat_and_cache_mla_rope_fused_kernel<qk_t, true, RAW_KV_T,     \
-                                                     CACHE_T, KV_DTYPE>        \
-            <<<grid, block, 0, stream>>>(                                      \
-                positions.data_ptr<int64_t>(), q_pe.data_ptr<qk_t>(),          \
-                k_pe.data_ptr<qk_t>(), kv_c.data_ptr<qk_t>(),                  \
-                rope_cos_sin_cache.data_ptr<qk_t>(), rot_dim,                  \
-                q_pe_stride_token, q_pe_stride_head, k_pe_stride, kv_c_stride, \
-                num_q_heads, reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),  \
-                kv_cache_slot_mapping.data_ptr<int64_t>(), block_stride,       \
-                entry_stride, kv_lora_rank, block_size,                        \
-                kv_cache_quant_scale.data_ptr<float>());                       \
-      } else {                                                                 \
-        vllm::concat_and_cache_mla_rope_fused_kernel<qk_t, false, RAW_KV_T,    \
-                                                     CACHE_T, KV_DTYPE>        \
-            <<<grid, block, 0, stream>>>(                                      \
-                positions.data_ptr<int64_t>(), q_pe.data_ptr<qk_t>(),          \
-                k_pe.data_ptr<qk_t>(), kv_c.data_ptr<qk_t>(),                  \
-                rope_cos_sin_cache.data_ptr<qk_t>(), rot_dim,                  \
-                q_pe_stride_token, q_pe_stride_head, k_pe_stride, kv_c_stride, \
-                num_q_heads, reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),  \
-                kv_cache_slot_mapping.data_ptr<int64_t>(), block_stride,       \
-                entry_stride, kv_lora_rank, block_size,                        \
-                kv_cache_quant_scale.data_ptr<float>());                       \
-      }                                                                        \
+      VLLM_DISPATCH_FLOATING_TYPES(                                            \
+          rope_cos_sin_cache.scalar_type(), "rope_cos_sin_cache_scalar_type",  \
+          [&] {                                                                \
+            using cos_sin_t = scalar_t;                                        \
+            if (rope_is_neox) {                                                \
+              vllm::concat_and_cache_mla_rope_fused_kernel<                    \
+                  qk_t, cos_sin_t, true, RAW_KV_T, CACHE_T, KV_DTYPE>          \
+                  <<<grid, block, 0, stream>>>(                                \
+                      positions.data_ptr<int64_t>(), q_pe.data_ptr<qk_t>(),    \
+                      k_pe.data_ptr<qk_t>(), kv_c.data_ptr<qk_t>(),            \
+                      rope_cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,       \
+                      q_pe_stride_token, q_pe_stride_head, k_pe_stride,        \
+                      kv_c_stride, num_q_heads,                                \
+                      reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),         \
+                      kv_cache_slot_mapping.data_ptr<int64_t>(), block_stride, \
+                      entry_stride, kv_lora_rank, block_size,                  \
+                      kv_cache_quant_scale.data_ptr<float>(),                  \
+                      k_pe_out.data_ptr<qk_t>());                              \
+            } else {                                                           \
+              vllm::concat_and_cache_mla_rope_fused_kernel<                    \
+                  qk_t, cos_sin_t, false, RAW_KV_T, CACHE_T, KV_DTYPE>         \
+                  <<<grid, block, 0, stream>>>(                                \
+                      positions.data_ptr<int64_t>(), q_pe.data_ptr<qk_t>(),    \
+                      k_pe.data_ptr<qk_t>(), kv_c.data_ptr<qk_t>(),            \
+                      rope_cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,       \
+                      q_pe_stride_token, q_pe_stride_head, k_pe_stride,        \
+                      kv_c_stride, num_q_heads,                                \
+                      reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),         \
+                      kv_cache_slot_mapping.data_ptr<int64_t>(), block_stride, \
+                      entry_stride, kv_lora_rank, block_size,                  \
+                      kv_cache_quant_scale.data_ptr<float>(),                  \
+                      k_pe_out.data_ptr<qk_t>());                              \
+            }                                                                  \
+          });                                                                  \
     });                                                                        \
   } while (false)
 
@@ -212,8 +228,12 @@ void concat_and_cache_mla_rope_fused(
         kv_cache_slot_mapping,  // [num_tokens] or [num_actual_tokens]
     torch::Tensor&
         kv_cache,  // [num_blocks, block_size, (kv_lora_rank + rot_dim)]
-    const std::string& kv_cache_dtype, torch::Tensor& kv_cache_quant_scale) {
-  const int64_t num_tokens = q_pe.size(0);
+    const std::string& kv_cache_dtype, torch::Tensor& kv_cache_quant_scale,
+    bool has_slot_mapping, torch::Tensor& k_pe_out) {
+  if (!has_slot_mapping) {
+    return;
+  }
+  const int64_t num_tokens = kv_cache_slot_mapping.size(0);
 
   const int num_q_heads = q_pe.size(1);
   const int rot_dim = q_pe.size(2);
@@ -224,24 +244,29 @@ void concat_and_cache_mla_rope_fused(
   TORCH_CHECK_EQ(positions.dim(), 1);
   TORCH_CHECK_EQ(positions.scalar_type(), c10::ScalarType::Long);
 
-  TORCH_CHECK_EQ(q_pe.size(0), num_tokens);
+  TORCH_CHECK_EQ(q_pe.dim(), 3);
+  TORCH_CHECK_GE(q_pe.size(0), num_tokens);
   TORCH_CHECK_EQ(q_pe.size(1), num_q_heads);
   TORCH_CHECK_EQ(q_pe.size(2), rot_dim);
-  TORCH_CHECK_EQ(q_pe.dim(), 3);
 
-  TORCH_CHECK_EQ(k_pe.size(0), num_tokens);
-  TORCH_CHECK_EQ(k_pe.size(1), rot_dim);
-  TORCH_CHECK_EQ(k_pe.dim(), 2);
+  TORCH_CHECK_EQ(k_pe.dim(), 3);
+  TORCH_CHECK_EQ(k_pe.size(0), q_pe.size(0));
+  TORCH_CHECK_EQ(k_pe.size(2), rot_dim);
   TORCH_CHECK_EQ(k_pe.scalar_type(), q_pe.scalar_type());
 
-  TORCH_CHECK_EQ(kv_c.size(0), num_tokens);
-  TORCH_CHECK_EQ(kv_c.size(1), kv_lora_rank);
+  TORCH_CHECK_EQ(k_pe_out.dim(), 3);
+  TORCH_CHECK_EQ(k_pe_out.size(0), q_pe.size(0));
+  TORCH_CHECK_EQ(k_pe_out.size(2), rot_dim);
+  TORCH_CHECK_EQ(k_pe_out.scalar_type(), q_pe.scalar_type());
+  TORCH_CHECK(k_pe_out.is_contiguous(), "k_pe_out must be contiguous");
+
   TORCH_CHECK_EQ(kv_c.dim(), 2);
+  TORCH_CHECK_EQ(kv_c.size(0), q_pe.size(0));
+  TORCH_CHECK_EQ(kv_c.size(1), kv_lora_rank);
   TORCH_CHECK_EQ(kv_c.scalar_type(), q_pe.scalar_type());
   TORCH_CHECK_EQ(kv_c.dtype(), q_pe.dtype());
 
   TORCH_CHECK_EQ(rope_cos_sin_cache.size(1), rot_dim);
-  TORCH_CHECK_EQ(rope_cos_sin_cache.scalar_type(), q_pe.scalar_type());
 
   TORCH_CHECK_EQ(kv_cache_slot_mapping.size(0), num_tokens);
   TORCH_CHECK_EQ(kv_cache_slot_mapping.scalar_type(), c10::ScalarType::Long);

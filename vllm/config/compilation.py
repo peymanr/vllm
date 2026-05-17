@@ -138,6 +138,8 @@ class PassConfig:
     """Enable fused allreduce+RMSNorm for MiniMax QK norm."""
     enable_qk_norm_rope_fusion: bool = False
     """Enable fused Q/K RMSNorm + RoPE pass."""
+    enable_cache_mla_rope_fusion: bool = False
+    """Enable fused MLA KV cache update with RoPE."""
 
     # ROCm/AITER specific fusions
     fuse_act_padding: bool = None  # type: ignore[assignment]
@@ -228,6 +230,7 @@ class PassConfig:
         "fuse_act_padding",
         "fuse_mla_dual_rms_norm",
         "fuse_rope_kvcache",
+        "enable_cache_mla_rope_fusion",
         mode="wrap",
     )
     @classmethod
@@ -285,6 +288,12 @@ class PassConfig:
                 "The fusion will be disabled."
             )
             self.fuse_rope_kvcache = False
+        if self.enable_cache_mla_rope_fusion and not current_platform.is_cuda_alike():
+            logger.warning_once(
+                "MLA KV cache update with RoPE fusion enabled but the "
+                "current platform is not CUDA-alike. The fusion will be disabled."
+            )
+            self.enable_cache_mla_rope_fusion = False
 
     def log_enabled_passes(self) -> None:
         """
@@ -335,6 +344,7 @@ class DynamicShapesConfig:
     - BACKED: Default PyTorch behavior with potential guards ignored.
     - UNBACKED: No guards guaranteed (most sound) but may throw
       data dependent errors.
+
     - BACKED_SIZE_OBLIVIOUS: Experimental safer alternative to
       backed/unbacked.
     """
@@ -1202,9 +1212,9 @@ class CompilationConfig:
                 )
                 self.cudagraph_mode = CUDAGraphMode.FULL
 
-        assert not self.splitting_ops_contain_attention(), (
-            "attention ops should not be in splitting_ops when fuse_attn_quant is True"
-        )
+        assert (
+            not self.splitting_ops_contain_attention()
+        ), "attention ops should not be in splitting_ops when fuse_attn_quant is True"
 
     def splitting_ops_contain_attention(self) -> bool:
         return self.splitting_ops is not None and all(
@@ -1265,9 +1275,10 @@ class CompilationConfig:
             if op in {"all", "none"}:
                 continue
 
-            assert op[0] in {"+", "-"}, (
-                "Invalid custom op syntax (should be checked during init)"
-            )
+            assert op[0] in {
+                "+",
+                "-",
+            }, "Invalid custom op syntax (should be checked during init)"
 
             # check if op name exists in model
             op_name = op[1:]
