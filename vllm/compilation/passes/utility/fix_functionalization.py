@@ -99,10 +99,14 @@ class FixFunctionalizationPass(VllmInductorPass):
             elif at_target == torch.ops._C.fused_add_rms_norm.default:
                 mutated_args = {1: "input", 2: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
-            elif at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default:  # noqa: E501
+            elif (
+                at_target == torch.ops._C.fused_add_rms_norm_static_fp8_quant.default
+            ):  # noqa: E501
                 mutated_args = {1: "result", 2: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
-            elif at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default:  # noqa: E501
+            elif (
+                at_target == torch.ops._C.rms_norm_dynamic_per_token_quant.default
+            ):  # noqa: E501
                 mutated_args = {1: "result", 2: "scale", 3: "residual"}
                 self.defunctionalize(graph, node, mutated_args)
             elif at_target in [
@@ -189,6 +193,12 @@ class FixFunctionalizationPass(VllmInductorPass):
             ):
                 mutated_args = {1: "x"}
                 self.defunctionalize(graph, node, mutated_args=mutated_args)
+            elif (
+                hasattr(torch.ops.vllm, "fused_concat_and_cache_mla_rope")
+                and at_target == torch.ops.vllm.fused_concat_and_cache_mla_rope.default
+            ):
+                mutated_args = {1: "q_pe"}
+                self.defunctionalize(graph, node, mutated_args=mutated_args)
             else:
                 continue  # skip the count
 
@@ -245,9 +255,9 @@ class FixFunctionalizationPass(VllmInductorPass):
             # Some functionalized nodes may return both a result at getitem[0]
             # as well as mutated args at getitem[1:...]
             if idx == 0:
-                assert idx not in mutated_args, (
-                    f"result at getitem[0] should not be in mutated_args for {node}"
-                )
+                assert (
+                    idx not in mutated_args
+                ), f"result at getitem[0] should not be in mutated_args for {node}"
                 continue
             arg = mutated_args[idx]
             arg = node.kwargs[arg] if isinstance(arg, str) else arg
@@ -283,9 +293,9 @@ class FixFunctionalizationPass(VllmInductorPass):
         :param args: If we cannot use kwargs, specify args directly.
         If an arg is a string, `node.kwargs[arg]` is used.
         """  # noqa: E501
-        assert is_func(node, auto_functionalized), (
-            f"node must be auto-functionalized, is {node} instead"
-        )
+        assert is_func(
+            node, auto_functionalized
+        ), f"node must be auto-functionalized, is {node} instead"
 
         # Create a new call to the original function
         with graph.inserting_before(node):

@@ -24,6 +24,9 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kNvfp4Dynamic,
 )
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
+from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
+    DeepseekScalingRotaryEmbedding,
+)
 from vllm.platforms import current_platform
 
 RMS_ADD_OP = torch.ops._C.fused_add_rms_norm.default
@@ -40,8 +43,12 @@ if current_platform.is_cuda() and hasattr(torch.ops._C, "scaled_fp4_quant"):
     QUANT_OPS[kNvfp4Dynamic] = torch.ops._C.scaled_fp4_quant.out  # noqa: E501
 
 if current_platform.is_cuda():
-    QUANT_OPS[kFp8Dynamic128Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
-    QUANT_OPS[kFp8Dynamic64Sym] = torch.ops._C.per_token_group_fp8_quant.default  # noqa: E501
+    QUANT_OPS[kFp8Dynamic128Sym] = (
+        torch.ops._C.per_token_group_fp8_quant.default
+    )  # noqa: E501
+    QUANT_OPS[kFp8Dynamic64Sym] = (
+        torch.ops._C.per_token_group_fp8_quant.default
+    )  # noqa: E501
 
 SILU_MUL_OP = torch.ops._C.silu_and_mul.default
 
@@ -159,6 +166,75 @@ class MatcherRotaryEmbedding(MatcherCustomOp):
         return result
 
 
+class MatcherDeepseekScalingRotaryEmbedding(MatcherCustomOp):
+    def __init__(
+        self,
+        is_neox: bool,
+        head_size: int,
+        num_heads: int,
+        num_kv_heads: int,
+        use_flashinfer: bool = False,
+        enabled: bool | None = None,
+    ) -> None:
+        if enabled is None:
+            enabled = DeepseekScalingRotaryEmbedding.enabled()
+
+        super().__init__(enabled)
+        self.is_neox = is_neox
+        self.head_size = head_size
+        self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+        self.q_size = self.num_heads * self.head_size
+        self.kv_size = self.num_kv_heads * self.head_size
+        self.rotary_dim = head_size
+
+    def inputs(self) -> list[torch.Tensor]:
+        positions = self.empty_int64(5)
+        key = self.empty(5, self.num_kv_heads, self.head_size)
+        cos_sin_cache = self.empty(4096, self.rotary_dim)
+        return [positions, key, cos_sin_cache]
+
+    def forward_custom(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        result: tuple[torch.Tensor, torch.Tensor | None] = (
+            DeepseekScalingRotaryEmbedding.forward_static(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.rotary_dim,
+                cos_sin_cache,
+                self.is_neox,
+            )
+        )
+        return result
+
+    def forward_native(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        cos_sin_cache: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        result: tuple[torch.Tensor, torch.Tensor | None] = (
+            DeepseekScalingRotaryEmbedding.forward_static(
+                positions,
+                query,
+                key,
+                self.head_size,
+                self.rotary_dim,
+                cos_sin_cache,
+                self.is_neox,
+            )
+        )
+        return result
+
+
 class MatcherFusedAddRMSNorm(MatcherCustomOp):
     def __init__(
         self,
@@ -246,9 +322,9 @@ class MatcherQuantFP8(MatcherCustomOp):
         self.is_tma_aligned = is_tma_aligned
 
         if match_rocm_aiter:
-            assert not quant_key.scale.group_shape.is_per_tensor(), (
-                "ROCm aiter fusion pass does not support per tensor quantization"
-            )
+            assert (
+                not quant_key.scale.group_shape.is_per_tensor()
+            ), "ROCm aiter fusion pass does not support per tensor quantization"
             if quant_key.scale.group_shape.is_per_token():
                 self.QUANT_OP = rocm_aiter_ops.get_per_token_quant_op()
             else:
@@ -264,14 +340,14 @@ class MatcherQuantFP8(MatcherCustomOp):
                     )
 
         else:
-            assert quant_key in QUANT_OPS, (
-                f"unsupported quantization scheme {quant_key}"
-            )
+            assert (
+                quant_key in QUANT_OPS
+            ), f"unsupported quantization scheme {quant_key}"
             self.QUANT_OP = QUANT_OPS[quant_key]
 
-            assert quant_key.dtype == current_platform.fp8_dtype(), (
-                "Only QuantFP8 supported by"
-            )
+            assert (
+                quant_key.dtype == current_platform.fp8_dtype()
+            ), "Only QuantFP8 supported by"
             assert quant_key.scale2 is None
 
         self.quant_fp8 = QuantFP8(
