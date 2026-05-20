@@ -74,6 +74,82 @@ class CUDAGraphMode(enum.Enum):
             return mode.value in self.value
         return self == mode
 
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+import enum
+from collections import Counter
+from collections.abc import Callable
+from dataclasses import field, fields
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
+
+from pydantic import Field, TypeAdapter, field_validator
+
+import vllm.envs as envs
+from vllm.compilation.passes.inductor_pass import CallableInductorPass, InductorPass
+from vllm.config.utils import (
+    Range,
+    config,
+    get_hash_factors,
+    hash_factors,
+)
+from vllm.logger import init_logger
+from vllm.platforms import current_platform
+from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.math_utils import round_up
+from vllm.utils.torch_utils import is_torch_equal_or_newer
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+else:
+    VllmConfig = object
+
+logger = init_logger(__name__)
+
+
+class CompilationMode(enum.IntEnum):
+    """The compilation approach used for torch.compile-based compilation of the
+    model."""
+
+    NONE = 0
+    """No torch.compile compilation is applied, model runs in fully eager pytorch mode.
+    The model runs as-is."""
+    STOCK_TORCH_COMPILE = 1
+    """The standard `torch.compile` compilation pipeline."""
+    DYNAMO_TRACE_ONCE = 2
+    """Single Dynamo trace through the model, avoiding recompilation."""
+    VLLM_COMPILE = 3
+    """Custom vLLM Inductor-based backend with caching, piecewise compilation,
+    shape specialization, and custom passes."""
+
+
+class CUDAGraphMode(enum.Enum):
+    """Constants for the cudagraph mode in CompilationConfig.
+    Meanwhile, the subset enum `NONE`, `PIECEWISE` and `FULL` are also
+    treated as concrete runtime mode for cudagraph runtime dispatching.
+    """
+
+    NONE = 0
+    PIECEWISE = 1
+    FULL = 2
+    FULL_DECODE_ONLY = (FULL, NONE)
+    FULL_AND_PIECEWISE = (FULL, PIECEWISE)
+
+    def decode_mode(self) -> "CUDAGraphMode":
+        return CUDAGraphMode(self.value[0]) if self.separate_routine() else self
+
+    def mixed_mode(self) -> "CUDAGraphMode":
+        return CUDAGraphMode(self.value[1]) if self.separate_routine() else self
+
+    def has_mode(self, mode: "CUDAGraphMode") -> bool:
+        assert not mode.separate_routine()
+        if self.separate_routine():
+            return mode.value in self.value
+        return self == mode
+
     def requires_piecewise_compilation(self) -> bool:
         return self.has_mode(CUDAGraphMode.PIECEWISE)
 
@@ -344,6 +420,60 @@ class DynamicShapesConfig:
     - BACKED: Default PyTorch behavior with potential guards ignored.
     - UNBACKED: No guards guaranteed (most sound) but may throw
       data dependent errors.
+    - BACKED_SIZE_OBLIVIOUS: Experimental safer alternative to
+      backed/unbacked.
+    """
+
+    evaluate_guards: bool = False
+    """
+    A debug mode to detect and fail if Dynamo ever specializes a dynamic shape by
+    guarding on it. When True, dynamic shape guards are not dropped from dynamo.
+    And a failure will be triggered if a recompilation ever happens due to that.
+    This mode requires VLLM_USE_BYTECODE_HOOK to be 0.
+    Enabling this allow observing the dynamic shapes guards in the tlparse
+    artifacts also.
+    When type is backed, aot_compile must be disabled for this mode to work.
+    until this change picked up https://github.com/pytorch/pytorch/pull/169239.
+    """
+
+    assume_32_bit_indexing: bool = False
+    """
+    whether all tensor sizes can use 32 bit indexing.
+    `True` requires PyTorch 2.10+
+    """
+
+    def compute_hash(self) -> str:
+        """
+        Provide a hash for DynamicShapesConfig
+        """
+
+        from vllm.config.utils import get_hash_factors, hash_factors
+
+        factors = get_hash_factors(self, set())
+        return hash_factors(factors)
+
+
+@config
+class CompilationConfig:
+    """Configuration for compilation.
+
+    You must pass CompilationConfig to VLLMConfig constructor.
+    VLLMConfig's post_init does further initialization. If used outside of the
+    VLLMConfig, some fields will be left in an improper state.
+
+    It contains PassConfig, which controls the custom fusion/transformation passes.
+    The rest has three parts:
+
+    - Top-level Compilation control:
+        - [`mode`][vllm.config.CompilationConfig.mode]
+        - [`debug_dump_path`][vllm.config.CompilationConfig.debug_dump_path]
+        - [`cache_dir`][vllm.config.CompilationConfig.cache_dir]
+        - [`backend`][vllm.config.CompilationConfig.backend]
+        - [`custom_ops`][vllm.config.CompilationConfig.custom_ops]
+        - [`splitting_ops`][vllm.config.CompilationConfig.splitting_ops]
+        - [`compile_mm_encoder`][vllm.config.CompilationConfig.compile_mm_encoder]
+    - CudaGraph capture:
+        - [`cudagraph_mode`][vllm.config.CompilationConfig.cudagraph_mode]
     - BACKED_SIZE_OBLIVIOUS: Experimental safer alternative to
       backed/unbacked.
     """
