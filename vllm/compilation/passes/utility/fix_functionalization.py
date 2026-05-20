@@ -190,6 +190,16 @@ class FixFunctionalizationPass(VllmInductorPass):
                 # a sequence of aten ops on q: view+slice+copy+slice_scatter.
                 # Since the fused MLA RoPE op mutates q_pe in-place, we can remove
                 # the redundant copy and slice_scatter ops during defunctionalization.
+                #
+                # k_pe is no longer mutated in-place: the fused kernel now writes
+                # the rotated k_pe into a fresh contiguous `k_pe_out` tensor that
+                # is returned from the op. After auto-functionalization, that
+                # return value shows up as getitem[0] of the auto_functionalized
+                # node. `insert_defunctionalized` already rewires the getitem[0]
+                # user to the new defunctionalized call's return value, so we
+                # don't need any manual k_pe rewiring here. This eliminates the
+                # extra Triton copy that previously bridged the rotated k_pe
+                # across the Inductor partition boundary.
                 getitem_nodes = self.getitem_users(node)
                 q_pe_out = getitem_nodes[1]
 
@@ -209,13 +219,6 @@ class FixFunctionalizationPass(VllmInductorPass):
                 self._remove(slice_temp)
                 self._remove(view_temp)
                 self._remove(q_pe_out)
-
-                # defunctionalize k_pe manually; self.replace_users_with_mutated_args
-                # does not support only replacing specific kwargs
-                k_pe_in = node.kwargs["k_pe"]
-                k_pe_out = getitem_nodes[2]
-                k_pe_out.replace_all_uses_with(k_pe_in)
-                self._remove(k_pe_out)
 
                 self.insert_defunctionalized(graph, node)
                 self._remove(node)
