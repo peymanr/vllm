@@ -25,14 +25,16 @@ template <typename qk_t, typename cos_sin_t, bool IS_NEOX,
           typename raw_kv_scalar_t, typename cache_t, Fp8KVCacheDataType kv_dt>
 __global__ void concat_and_cache_mla_rope_fused_kernel(
     const int64_t* __restrict__ positions,  // [num_tokens]
-    qk_t* __restrict__ q_pe,        // [num_tokens, num_q_heads, rot_dim]
-    qk_t* __restrict__ k_pe,        // [num_tokens, rot_dim]
-    const qk_t* __restrict__ kv_c,  // [num_tokens, kv_lora_rank]
+    qk_t* __restrict__ q_pe,              // [num_tokens, num_q_heads, rot_dim]
+    const qk_t* __restrict__ k_pe,        // [num_tokens, rot_dim]
+    qk_t* __restrict__ k_pe_out,          // [num_tokens, rot_dim] (contiguous)
+    const qk_t* __restrict__ kv_c,        // [num_tokens, kv_lora_rank]
     const cos_sin_t* __restrict__ rope_cos_sin_cache,  // [max_position, 2,
                                                        // rot_dim // 2]
     const int rot_dim, const int64_t q_pe_stride_token,
     const int64_t q_pe_stride_head, const int64_t k_pe_stride,
-    const int64_t kv_c_stride, const int num_q_heads,
+    const int64_t k_pe_out_stride, const int64_t kv_c_stride,
+    const int num_q_heads,
     cache_t* __restrict__ kv_cache,  // [num_blocks, block_size, (kv_lora_rank +
                                      // rot_dim)]
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
@@ -51,7 +53,7 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
 
   const int embed_dim = rot_dim / 2;
 
-  // Q ROPE
+  // Q ROPE (still in-place on q_pe)
   const int nq = num_q_heads * embed_dim;
   for (int i = threadIdx.x; i < nq; i += blockDim.x) {
     int head_idx = i / embed_dim;
@@ -89,14 +91,16 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
   const int64_t block_idx = slot_idx / block_size;
   const int64_t entry_idx = slot_idx % block_size;
 
-  // K with 1 HEAD
+  // K with 1 HEAD - read from k_pe (input), write rotated to k_pe_out and to
+  // kv_cache.
   for (int i = threadIdx.x; i < embed_dim; i += blockDim.x) {
     int pair_idx = i;
 
     qk_t cos = static_cast<qk_t>(VLLM_LDG(cos_sin_ptr + pair_idx));
     qk_t sin = static_cast<qk_t>(VLLM_LDG(cos_sin_ptr + pair_idx + embed_dim));
 
-    qk_t* k_pe_head_ptr = k_pe + token_idx * k_pe_stride;
+    const qk_t* k_pe_head_ptr = k_pe + token_idx * k_pe_stride;
+    qk_t* k_pe_out_head_ptr = k_pe_out + token_idx * k_pe_out_stride;
 
     int pair_idx_x, pair_idx_y;
     if constexpr (IS_NEOX) {
@@ -115,8 +119,11 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
     qk_t x_dst = x_src * cos - y_src * sin;
     qk_t y_dst = y_src * cos + x_src * sin;
 
-    k_pe_head_ptr[pair_idx_x] = x_dst;
-    k_pe_head_ptr[pair_idx_y] = y_dst;
+    // Write rotated k_pe into the fresh contiguous output buffer. This
+    // eliminates the extra Triton copy that previously had to bridge the
+    // Inductor partition boundary.
+    k_pe_out_head_ptr[pair_idx_x] = x_dst;
+    k_pe_out_head_ptr[pair_idx_y] = y_dst;
 
     // NOTE Why is this monster necessary?
     // When K is of type float16, the actual template replacement for
@@ -177,10 +184,11 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
                   qk_t, cos_sin_t, true, RAW_KV_T, CACHE_T, KV_DTYPE>         \
                   <<<grid, block, 0, stream>>>(                               \
                       positions.data_ptr<int64_t>(), q_pe.data_ptr<qk_t>(),   \
-                      k_pe.data_ptr<qk_t>(), kv_c.data_ptr<qk_t>(),           \
+                      k_pe.data_ptr<qk_t>(), k_pe_out.data_ptr<qk_t>(),       \
+                      kv_c.data_ptr<qk_t>(),                                  \
                       rope_cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,      \
                       q_pe_stride_token, q_pe_stride_head, k_pe_stride,       \
-                      kv_c_stride, num_q_heads,                               \
+                      k_pe_out_stride, kv_c_stride, num_q_heads,              \
                       reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),        \
                       slot_mapping.data_ptr<int64_t>(), block_stride,         \
                       entry_stride, kv_lora_rank, block_size,                 \
@@ -190,10 +198,11 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
                   qk_t, cos_sin_t, false, RAW_KV_T, CACHE_T, KV_DTYPE>        \
                   <<<grid, block, 0, stream>>>(                               \
                       positions.data_ptr<int64_t>(), q_pe.data_ptr<qk_t>(),   \
-                      k_pe.data_ptr<qk_t>(), kv_c.data_ptr<qk_t>(),           \
+                      k_pe.data_ptr<qk_t>(), k_pe_out.data_ptr<qk_t>(),       \
+                      kv_c.data_ptr<qk_t>(),                                  \
                       rope_cos_sin_cache.data_ptr<cos_sin_t>(), rot_dim,      \
                       q_pe_stride_token, q_pe_stride_head, k_pe_stride,       \
-                      kv_c_stride, num_q_heads,                               \
+                      k_pe_out_stride, kv_c_stride, num_q_heads,              \
                       reinterpret_cast<CACHE_T*>(kv_cache.data_ptr()),        \
                       slot_mapping.data_ptr<int64_t>(), block_stride,         \
                       entry_stride, kv_lora_rank, block_size,                 \
@@ -204,13 +213,17 @@ __global__ void concat_and_cache_mla_rope_fused_kernel(
   } while (false)
 
 // Executes RoPE on q_pe and k_pe, then writes k_pe and kv_c in the kv cache.
-// q_pe and k_pe are modified in place.
+// q_pe is modified in place. The rotated k_pe is emitted into a fresh
+// contiguous k_pe_out tensor (and also stored into the kv cache). This avoids
+// an extra Triton copy across the Inductor partition boundary that was
+// previously required when k_pe was rotated in-place.
 // Replaces DeepseekScalingRotaryEmbedding.self.rotary_emb and
 // concat_and_cache_mla.
 void concat_and_cache_mla_rope_fused(
     torch::Tensor& positions,           // [num_tokens]
     torch::Tensor& q_pe,                // [num_tokens, num_q_heads, rot_dim]
-    torch::Tensor& k_pe,                // [num_tokens, rot_dim]
+    torch::Tensor& k_pe,                // [num_tokens, rot_dim] (input)
+    torch::Tensor& k_pe_out,            // [num_tokens, rot_dim] (output)
     torch::Tensor& kv_c,                // [num_tokens, kv_lora_rank]
     torch::Tensor& rope_cos_sin_cache,  // [max_position, rot_dim]
     bool rope_is_neox,
@@ -250,6 +263,13 @@ void concat_and_cache_mla_rope_fused(
   TORCH_CHECK_EQ(k_pe.size(1), rot_dim);
   TORCH_CHECK_EQ(k_pe.scalar_type(), q_pe.scalar_type());
 
+  TORCH_CHECK_EQ(k_pe_out.dim(), 2);
+  TORCH_CHECK_EQ(k_pe_out.size(0), num_padded_tokens);
+  TORCH_CHECK_EQ(k_pe_out.size(1), rot_dim);
+  TORCH_CHECK_EQ(k_pe_out.scalar_type(), q_pe.scalar_type());
+  TORCH_CHECK(k_pe_out.is_contiguous(),
+              "k_pe_out must be a freshly-allocated contiguous tensor");
+
   TORCH_CHECK_EQ(kv_c.dim(), 2);
   TORCH_CHECK_EQ(kv_c.size(0), num_padded_tokens);
   TORCH_CHECK_EQ(kv_c.size(1), kv_lora_rank);
@@ -271,6 +291,7 @@ void concat_and_cache_mla_rope_fused(
   int64_t q_pe_stride_head = q_pe.stride(1);
 
   int64_t k_pe_stride = k_pe.stride(0);
+  int64_t k_pe_out_stride = k_pe_out.stride(0);
   int64_t kv_c_stride = kv_c.stride(0);
 
   int block_size = kv_cache.size(1);

@@ -384,12 +384,17 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "                     Tensor scale) -> ()");
   cache_ops.impl("concat_and_cache_mla", torch::kCUDA, &concat_and_cache_mla);
 
-  // Rotate Q and K, then write to kv cache for MLA
+  // Rotate Q and K, then write to kv cache for MLA.
+  // The rotated k_pe is emitted into a fresh contiguous output tensor
+  // `k_pe_out` (rather than mutating `k_pe` in place), so that the Inductor
+  // partitioner doesn't need to insert an additional copy across the
+  // partition boundary.
   cache_ops.def(
       "concat_and_cache_mla_rope_fused("
       "                     Tensor positions,"
       "                     Tensor! q_pe,"
-      "                     Tensor! k_pe,"
+      "                     Tensor k_pe,"
+      "                     Tensor! k_pe_out,"
       "                     Tensor kv_c,"
       "                     Tensor cos_sin_cache,"
       "                     bool is_neox,"
@@ -406,104 +411,51 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cache_ops), cache_ops) {
       "str kv_cache_dtype) -> ()");
   cache_ops.impl("convert_fp8", torch::kCUDA, &convert_fp8);
 
-  // Gather cache blocks from src_cache to dst, dequantizing from
-  // src_cache's dtype to dst's dtype if necessary.
+  // Gather cache blocks from src_cache to dst, optionally dequantizing
+  // from FP8.
   cache_ops.def(
-      "gather_and_maybe_dequant_cache(Tensor src_cache, Tensor! dst, "
-      "                               Tensor block_table, Tensor cu_seq_lens, "
-      "                               Tensor token_to_seq, "
-      "                               int num_tokens, "
-      "                               str kv_cache_dtype, "
-      "                               Tensor scale, Tensor? seq_starts) -> ()");
+      "gather_and_maybe_dequant_cache("
+      "  Tensor src_cache, Tensor! dst, Tensor block_table,"
+      "  Tensor cu_seq_lens, Tensor token_to_seq, int num_tokens,"
+      "  str kv_cache_dtype, Tensor scale,"
+      "  Tensor? seq_starts=None) -> ()");
   cache_ops.impl("gather_and_maybe_dequant_cache", torch::kCUDA,
                  &gather_and_maybe_dequant_cache);
 
   cache_ops.def(
-      "cp_gather_cache(Tensor src_cache, Tensor! dst, Tensor block_table, "
-      "Tensor cu_seq_lens, int batch_size, Tensor? seq_starts) -> ()");
+      "cp_gather_cache("
+      "  Tensor src_cache, Tensor! dst, Tensor block_table,"
+      "  Tensor cu_seq_lens, int batch_size,"
+      "  Tensor? seq_starts=None) -> ()");
   cache_ops.impl("cp_gather_cache", torch::kCUDA, &cp_gather_cache);
 
   cache_ops.def(
-      "cp_gather_and_upconvert_fp8_kv_cache(Tensor src_cache, Tensor! dst, "
-      "Tensor block_table, Tensor seq_lens, Tensor workspace_starts, int "
-      "batch_size) -> ()");
+      "cp_gather_and_upconvert_fp8_kv_cache("
+      "  Tensor src_cache, Tensor! dst, Tensor block_table,"
+      "  Tensor seq_lens, Tensor workspace_starts, int batch_size) -> ()");
   cache_ops.impl("cp_gather_and_upconvert_fp8_kv_cache", torch::kCUDA,
                  &cp_gather_and_upconvert_fp8_kv_cache);
 
+  // Indexer K quantization and cache function
   cache_ops.def(
-      "indexer_k_quant_and_cache(Tensor k, Tensor! kv_cache, Tensor "
-      "slot_mapping, "
-      "int quant_block_size, str kv_cache_dtype) -> ()");
+      "indexer_k_quant_and_cache("
+      "  Tensor k, Tensor! kv_cache, Tensor slot_mapping,"
+      "  int quant_block_size, str scale_fmt) -> ()");
   cache_ops.impl("indexer_k_quant_and_cache", torch::kCUDA,
                  &indexer_k_quant_and_cache);
 
+  // Concatenate query nope and rope for MLA/DSA attention
   cache_ops.def(
       "concat_mla_q(Tensor ql_nope, Tensor q_pe, Tensor! q_out) -> ()");
   cache_ops.impl("concat_mla_q", torch::kCUDA, &concat_mla_q);
 
+  // Extract function to gather quantized K cache
   cache_ops.def(
-      "cp_gather_indexer_k_quant_cache(Tensor kv_cache, Tensor! dst_k, Tensor! "
-      "dst_scale, Tensor block_table, Tensor cu_seq_lens) -> ()");
+      "cp_gather_indexer_k_quant_cache("
+      "  Tensor kv_cache, Tensor! dst_k, Tensor! dst_scale,"
+      "  Tensor block_table, Tensor cu_seq_lens) -> ()");
   cache_ops.impl("cp_gather_indexer_k_quant_cache", torch::kCUDA,
                  &cp_gather_indexer_k_quant_cache);
-}
-
-TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _cuda_utils), cuda_utils) {
-  // Cuda utils
-
-  // Gets the specified device attribute.
-  cuda_utils.def("get_device_attribute(int attribute, int device_id) -> int");
-  cuda_utils.impl("get_device_attribute", &get_device_attribute);
-
-  // Gets the maximum shared memory per block device attribute.
-  cuda_utils.def(
-      "get_max_shared_memory_per_block_device_attribute(int device_id) -> int");
-  cuda_utils.impl("get_max_shared_memory_per_block_device_attribute",
-                  &get_max_shared_memory_per_block_device_attribute);
-}
-
-TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
-  // Custom all-reduce kernels
-  custom_ar.def(
-      "init_custom_ar(int[] ipc_tensors, Tensor rank_data, "
-      "int rank, bool fully_connected) -> int");
-  custom_ar.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
-  custom_ar.def(
-      "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
-      "int reg_buffer_sz_bytes) -> ()");
-  custom_ar.impl("all_reduce", torch::kCUDA, &all_reduce);
-
-  custom_ar.def("dispose", &dispose);
-  custom_ar.def("meta_size", &meta_size);
-
-  custom_ar.def("register_buffer", &register_buffer);
-  custom_ar.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
-  custom_ar.def("register_graph_buffers", &register_graph_buffers);
-
-  custom_ar.def("allocate_shared_buffer_and_handle",
-                &allocate_shared_buffer_and_handle);
-  custom_ar.def("open_mem_handle(Tensor mem_handle) -> int", &open_mem_handle);
-  custom_ar.impl("open_mem_handle", torch::kCPU, &open_mem_handle);
-
-  custom_ar.def("free_shared_buffer", &free_shared_buffer);
-#ifdef USE_ROCM
-  // Quick Reduce all-reduce kernels
-  custom_ar.def(
-      "qr_all_reduce(int fa, Tensor inp, Tensor out, int quant_level, bool "
-      "cast_bf2half) -> ()");
-  custom_ar.impl("qr_all_reduce", torch::kCUDA, &qr_all_reduce);
-
-  custom_ar.def("init_custom_qr", &init_custom_qr);
-  custom_ar.def("qr_destroy", &qr_destroy);
-
-  custom_ar.def("qr_get_handle", &qr_get_handle);
-
-  custom_ar.def("qr_open_handles(int _fa, Tensor[](b!) handles) -> ()");
-  custom_ar.impl("qr_open_handles", torch::kCPU, &qr_open_handles);
-
-  // Max input size in bytes
-  custom_ar.def("qr_max_size", &qr_max_size);
-#endif
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)
