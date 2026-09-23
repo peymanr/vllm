@@ -89,9 +89,9 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
 
             max_block = triton.cdiv(d.max_seq_len, SPARSE_BLOCK_SIZE)
 
-            # During cudagraph capture / warmup, fall through to base impl
-            # to avoid allreduce shape issues across different batch sizes.
-            if torch.compiler.is_compiling() or max_block == 0 or rank >= max_block:
+            # During cudagraph capture, fall through to base impl
+            # (dist.all_reduce not compatible with static graph recording).
+            if torch.compiler.is_compiling() or max_block == 0:
                 decode_topk, prefill_topk = super().forward(
                     index_query,
                     attention_block_table=attention_block_table,
