@@ -126,7 +126,9 @@ def indexer_context_scores(
         (heads, tokens, local), dtype=torch.float32, device=idx_q.device
     )
     if tokens:
-        chunks = min(local, _decode_score_chunks(seq_lens.numel(), local))
+        # Number of grid-y chunks: cap at local_blocks, target ~64 CTAs/req.
+        target = max(1, min(local, 64 // max(1, seq_lens.numel())))
+        chunks = 1 << (target.bit_length() - 1)
         _context_score[(seq_lens.numel(), chunks)](
             idx_q,
             index_cache,
@@ -149,3 +151,4 @@ def indexer_context_scores(
             num_stages=3,
         )
     return scores
+
