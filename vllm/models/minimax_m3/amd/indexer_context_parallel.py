@@ -88,6 +88,18 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
             rank = get_tp_group().rank_in_group
 
             max_block = triton.cdiv(d.max_seq_len, SPARSE_BLOCK_SIZE)
+
+            # During cudagraph capture / warmup, fall through to base impl
+            # to avoid allreduce shape issues across different batch sizes.
+            if torch.compiler.is_compiling() or max_block == 0 or rank >= max_block:
+                decode_topk, prefill_topk = super().forward(
+                    index_query,
+                    attention_block_table=attention_block_table,
+                    sparse_block_table_out=sparse_block_table_out,
+                    sparse_context_lens_out=sparse_context_lens_out,
+                    block_page_stride=block_page_stride,
+                )
+                return decode_topk, prefill_topk
             stride = _round_up_16(max_block)
 
             # Global score tensor pre-filled with -inf.
@@ -121,22 +133,13 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
             )
             local_blocks = local_scores.shape[2]
             n_owned = min(len(owned_cols), local_blocks)
-            global_score[:, :, owned_cols[:n_owned]] = local_scores[
-                :, :, :n_owned
-            ]
+            global_score[:, :, owned_cols[:n_owned]] = local_scores[:, :, :n_owned]
+
 
             # MAX allreduce: each rank's -inf placeholders are replaced by the
             # owning rank's real scores. Result is the full global score matrix.
             dist.all_reduce(global_score, op=dist.ReduceOp.MAX, group=get_tp_group().device_group)
 
-            fused_sparse_kwargs: dict = {}
-            if attention_block_table is not None:
-                fused_sparse_kwargs = {
-                    "attention_block_table": attention_block_table,
-                    "sparse_block_table_out": sparse_block_table_out,
-                    "sparse_context_lens_out": sparse_context_lens_out,
-                    "block_page_stride": block_page_stride,
-                }
             decode_topk = minimax_m3_index_decode(
                 iq[:nd],
                 kv,
@@ -151,7 +154,6 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
                 d.max_decode_query_len,
                 out=buf_htk,
                 precomputed_score=global_score,
-                **fused_sparse_kwargs,
             )
 
         if index_md.num_prefills > 0:
