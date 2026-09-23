@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MiniMax M3 lightning indexer: side cache, metadata, and impl.
@@ -539,7 +540,7 @@ def select_indexer_impl_cls(
     if (
         current_platform.is_rocm()
         and get_tensor_model_parallel_world_size() > 1
-        and envs.VLLM_ROCM_MINIMAX_INDEXER_CP
+        and os.environ.get("VLLM_ROCM_MINIMAX_INDEXER_CP", "False").lower() in ("true", "1")
     ):
         from vllm.models.minimax_m3.amd.indexer_context_parallel import (
             MiniMaxM3IndexerTritonCPImpl,
