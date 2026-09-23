@@ -12,7 +12,6 @@ Enabled by ``VLLM_ROCM_MINIMAX_INDEXER_CP=1`` (ROCm, TP>1 only).
 """
 
 import torch
-import torch.distributed as dist
 import triton
 
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -127,11 +126,7 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
 
             # MAX allreduce: each rank's -inf placeholders are replaced by the
             # owning rank's real scores. Result is the full global score matrix.
-            dist.all_reduce(
-                global_score,
-                op=dist.ReduceOp.MAX,
-                group=get_tp_group().device_group,
-            )
+            get_tp_group().all_reduce(global_score, op="max")
 
             fused_sparse_kwargs: dict = {}
             if attention_block_table is not None:
@@ -168,3 +163,4 @@ class MiniMaxM3IndexerTritonCPImpl(MiniMaxM3IndexerTritonImpl):
             )
 
         return decode_topk, prefill_topk
+
